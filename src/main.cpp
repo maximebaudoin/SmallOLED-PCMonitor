@@ -407,7 +407,7 @@ void loop() {
           Serial.println("Touch button: Exiting manual clock mode (PC is online)");
         } else {
           // PC is offline (timeout triggered) - cycle through clock styles
-          settings.clockStyle = (settings.clockStyle + 1) % 12;
+          settings.clockStyle = (settings.clockStyle + 1) % 13;
           // Skip reserved clock style 4
           if (settings.clockStyle == 4) settings.clockStyle = 5;
           resetClockAnimationState();
@@ -542,6 +542,9 @@ void loop() {
         break;
       case 11:
         displayClockWithDino();
+        break;
+      case 12:
+        displayClockWithLogo();
         break;
       default:
         displayStandardClock();

@@ -456,6 +456,7 @@ The OLED will display:
 - **Dino Runner Clock**: A Chrome T-Rex homage - the dino runs and auto-jumps cacti over a scrolling ground with parallax clouds; at the minute change a pterodactyl swoops in, carries off the old digit, and the new one drops in from above. Optional clouds and date row.
 - **Standard Clock**: Simple centered clock with date and day of week
 - **Large Clock**: Extra-large time display with date
+- **Logo**: Static branding screen that shows a centered logo bitmap. Swap in your own artwork by editing the bitmap in `src/clocks/clock_logo.cpp` (instructions are in the file header).
 - **Cycle All Styles**: Rotates through every clock style automatically, switching every 5 minutes.
 
 Change clock style anytime via the web portal or touch button!

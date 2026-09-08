@@ -124,4 +124,7 @@ void resetAsteroidsAnimation();
 void displayClockWithDino();
 void resetDinoAnimation();
 
+// ========== Logo Clock ==========
+void displayClockWithLogo();
+
 #endif // CLOCKS_H
