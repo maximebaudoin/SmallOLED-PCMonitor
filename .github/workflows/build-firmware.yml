@@ -1,0 +1,70 @@
+name: Build firmware
+
+# Builds the ESP32-C3 firmware for every OLED variant and publishes the OTA
+# images as downloadable artifacts. Each `OTA-firmware-*.bin` is the file to
+# upload via the device's OTA page (http://<device-ip>/update).
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: oled-096
+            size: "0.96inch-SSD1306"
+          - env: oled-13
+            size: "1.3inch-SH1106"
+          - env: oled-154
+            size: "1.54inch-CH1116"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Read firmware version
+        id: ver
+        run: |
+          VER=$(grep -oP '#define FIRMWARE_VERSION "\K[^"]+' src/config/config.h)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Build ${{ matrix.env }}
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Stage OTA binary
+        run: |
+          mkdir -p out
+          BD=".pio/build/${{ matrix.env }}"
+          V="${{ steps.ver.outputs.version }}"
+          S="${{ matrix.size }}"
+          # OTA image (application only) - upload this one on the /update page
+          cp "$BD/firmware.bin" "out/OTA-firmware-v$V-OLED_$S.bin"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.size }}
+          path: out/*.bin
+          if-no-files-found: error
