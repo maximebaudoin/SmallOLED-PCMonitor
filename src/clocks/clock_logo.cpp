@@ -29,7 +29,7 @@
 // ---------------------------------------------------------------------------
 // Logo bitmap (replace with your own - see instructions above)
 // ---------------------------------------------------------------------------
-#define LOGO_WIDTH  64
+#define LOGO_WIDTH  128
 #define LOGO_HEIGHT 64
 
 static const unsigned char LOGO_BITMAP[] PROGMEM = {
