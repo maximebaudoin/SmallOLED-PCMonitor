@@ -123,6 +123,7 @@ static const char PAGE_HTML[] PROGMEM = R"PAGE(<!doctype html>
                   <option value="8" %SEL_CLOCKSTYLE_8%>Tetris</option>
                   <option value="10" %SEL_CLOCKSTYLE_10%>Asteroids</option>
                   <option value="11" %SEL_CLOCKSTYLE_11%>Dino Runner</option>
+                  <option value="12" %SEL_CLOCKSTYLE_12%>Logo</option>
                   <option value="9" %SEL_CLOCKSTYLE_9%>Cycle All Styles (each 5m)</option>
                 </select>
               </div>
