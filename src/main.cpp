@@ -43,6 +43,10 @@
 #include "config/config.h"
 #include "utils/utils.h"
 #include "timezones.h"
+#include "viz/visualizer.h"
+#if GAMEPAD_ENABLED
+#include "game/game_mode.h"
+#endif
 
 // ========== External Objects ==========
 extern WiFiUDP udp;              // Defined in network.cpp
@@ -55,7 +59,7 @@ extern Preferences preferences;  // Defined in settings.cpp
   #if DISPLAY_INTERFACE == 1
     Adafruit_CH1116 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, SPI_DC_PIN, SPI_RST_PIN, SPI_CS_PIN);
   #else
-    Adafruit_CH1116 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+    Adafruit_CH1116 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1, DISPLAY_I2C_CLOCK);
   #endif
   #define DISPLAY_WHITE SH110X_WHITE
   #define DISPLAY_BLACK SH110X_BLACK
@@ -64,7 +68,7 @@ extern Preferences preferences;  // Defined in settings.cpp
   #if DISPLAY_INTERFACE == 1
     Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, SPI_DC_PIN, SPI_RST_PIN, SPI_CS_PIN);
   #else
-    Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+    Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1, DISPLAY_I2C_CLOCK);
   #endif
   #define DISPLAY_WHITE SH110X_WHITE
   #define DISPLAY_BLACK SH110X_BLACK
@@ -73,7 +77,7 @@ extern Preferences preferences;  // Defined in settings.cpp
   #if DISPLAY_INTERFACE == 1
     Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, SPI_DC_PIN, SPI_RST_PIN, SPI_CS_PIN);
   #else
-    Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+    Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1, DISPLAY_I2C_CLOCK);
   #endif
   #define DISPLAY_WHITE SSD1306_WHITE
   #define DISPLAY_BLACK SSD1306_BLACK
@@ -90,6 +94,10 @@ unsigned long wifiDisconnectTime = 0;
 unsigned long nextDisplayUpdate = 0;
 bool wifiConnected = false;  // WiFi connection status for icon display
 bool httpForceClock = false;  // HTTP override to force clock mode (via /api/mode/clock)
+bool httpForceViz = false;    // HTTP override to force the audio visualizer (via /api/mode/viz)
+#if VIZ_DEBUG_FB
+float measuredFps = 0.0f;     // Frames/s actually pushed to the panel (debug builds only)
+#endif
 
 #if TOUCH_BUTTON_ENABLED
 bool manualClockMode = false;  // Manual override to force clock mode when PC is online
@@ -109,6 +117,7 @@ int getOptimalRefreshRate();
 #include "metrics/metrics.h"
 #include "network/network.h"
 #include "web/web.h"
+#include "weather/weather.h"
 
 
 // ========== Helper Functions ==========
@@ -129,6 +138,17 @@ const char* getResetReasonName() {
   }
 }
 
+// One non-blocking read of the system clock. getLocalTime(info, 0) cannot be
+// used for this: it stamps millis(), then loops while elapsed <= budget, so a
+// millisecond tick landing in between skips every attempt and reports failure.
+// In a render loop that shows up as content vanishing for single frames.
+bool peekLocalTime(struct tm *info) {
+  time_t now;
+  time(&now);
+  localtime_r(&now, info);
+  return info->tm_year > 120;
+}
+
 // Helper function to get time with short timeout
 bool getTimeWithTimeout(struct tm *timeinfo, unsigned long timeout_ms) {
   if (!ntpSynced) {
@@ -146,8 +166,180 @@ bool getTimeWithTimeout(struct tm *timeinfo, unsigned long timeout_ms) {
   return getLocalTime(timeinfo, timeout_ms);
 }
 
+// Selectable clock styles, in the order the touch button walks them. Ids match
+// AnimatedPixelClock so a style ported later keeps the same number on both
+// devices; 4 is a legacy alias for 3 and 12-15 are that project's styles we
+// have not ported, so neither appears here.
+const uint8_t CLOCK_STYLES[] = {0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 14, 16, 18, 19, 20};
+const uint8_t CLOCK_STYLE_COUNT = sizeof(CLOCK_STYLES) / sizeof(CLOCK_STYLES[0]);
+
+bool isValidClockStyle(uint8_t id) {
+  if (id == 4) return true;  // legacy alias for Space Invaders
+  for (uint8_t i = 0; i < CLOCK_STYLE_COUNT; i++) if (CLOCK_STYLES[i] == id) return true;
+  return false;
+}
+
+// Weather is skipped until a location is set, it has nothing to show before.
+uint8_t nextClockStyle(uint8_t current) {
+  for (uint8_t i = 0; i < CLOCK_STYLE_COUNT; i++) {
+    if (CLOCK_STYLES[i] != current) continue;
+    uint8_t next = CLOCK_STYLES[(i + 1) % CLOCK_STYLE_COUNT];
+    if (next == WEATHER_STYLE_ID && !weatherConfigured())
+      next = CLOCK_STYLES[(i + 2) % CLOCK_STYLE_COUNT];
+    return next;
+  }
+  return CLOCK_STYLES[0];
+}
+
+#if TOUCH_BUTTON_ENABLED
+// A style picked with the touch button is a real choice, so persist it the way
+// the web form does - it used to live in RAM only and was lost on the next
+// reboot. The write is held back until the taps stop, so stepping through the
+// styles costs one flash write and never stalls the frame that shows the pick.
+#define TOUCH_STYLE_SAVE_DELAY_MS 2000
+static bool touchStyleSavePending = false;
+static uint8_t touchStyleToSave = 0;
+static unsigned long touchStyleSaveAt = 0;
+
+void advanceClockStyleFromTouch() {
+  settings.clockStyle = nextClockStyle(settings.clockStyle);
+  resetClockAnimationState();
+  touchStyleSavePending = true;
+  touchStyleToSave = settings.clockStyle;
+  touchStyleSaveAt = millis();
+  Serial.print("Touch button: Clock style -> ");
+  Serial.println(settings.clockStyle);
+}
+
+// Dropped if the style changed again by other means (HTTP, demo, undo).
+void flushTouchStyleSave() {
+  if (!touchStyleSavePending || millis() - touchStyleSaveAt < TOUCH_STYLE_SAVE_DELAY_MS) return;
+  touchStyleSavePending = false;
+  if (settings.clockStyle == touchStyleToSave) saveClockStyle();
+}
+#endif
+
+#if TOUCH_BUTTON_ENABLED
+// One resolved tap: wake a dark panel, or step metrics -> clock -> visualizer.
+void handleTouchTap() {
+  if (handleTemporaryDisplayWake()) return;
+  // Stops are metrics -> clock -> visualizer -> metrics, skipping the
+  // ones that have nothing to show. The visualizer only joins while sound
+  // is actually playing: packets keep arriving through silence, so
+  // offering it then would hand the user a flat line and, before this,
+  // swallowed the clock stop entirely. With clock the only stop left, a
+  // tap cycles clock styles as it always did.
+  bool vizStop = vizHasSignal(3000);
+  bool metricsStop = metricData.online;
+  if (httpForceViz) {
+    httpForceViz = false;
+    manualClockMode = !metricsStop;
+    Serial.println("Touch button: Leaving visualizer");
+  } else if (manualClockMode) {
+    if (vizStop) {
+      manualClockMode = false;
+      httpForceViz = true;
+      vizNoteForced();
+      Serial.println("Touch button: Clock -> visualizer");
+    } else if (metricsStop) {
+      manualClockMode = false;
+      Serial.println("Touch button: Clock -> metrics");
+    } else {
+      advanceClockStyleFromTouch();
+    }
+  } else if (metricsStop) {
+    manualClockMode = true;
+    Serial.println("Touch button: Metrics -> clock");
+  } else if (vizStop) {
+    httpForceViz = true;
+    vizNoteForced();
+    Serial.println("Touch button: Clock -> visualizer");
+  } else {
+    advanceClockStyleFromTouch();
+  }
+}
+
+// Every tap acts at once. Waiting out the triple-tap gap first made a single
+// tap feel laggy, so the third tap of a quick run instead undoes what the
+// first two did and starts game mode.
+#define TOUCH_TAP_GAP_MS 400
+static void handleTouchTapAt(unsigned long now);
+
+void pollTouchTaps() {
+  unsigned long when;
+  while (checkTouchButtonPressed(&when)) handleTouchTapAt(when);
+}
+
+// `now` is the release time the interrupt stamped, so the gap between taps is
+// measured on the finger, not on how busy the loop was.
+static void handleTouchTapAt(unsigned long now) {
+  nextDisplayUpdate = 0; // draw the result now, not at the next frame slot
+#if GAMEPAD_ENABLED
+  static uint8_t count = 0;
+  static unsigned long lastTap = 0;
+  static uint8_t snapStyle = 0;
+  static bool snapManual = false, snapViz = false;
+  if (gameModeActive()) {
+    gameModeStop();
+    count = 0;
+    Serial.println("Touch button: Leaving game mode");
+    return;
+  }
+  if (!count || now - lastTap > TOUCH_TAP_GAP_MS) {
+    count = 0;
+    snapStyle = settings.clockStyle;
+    snapManual = manualClockMode;
+    snapViz = httpForceViz;
+  }
+  lastTap = now;
+  if (++count >= 3) {
+    count = 0;
+    if (settings.clockStyle != snapStyle) {
+      settings.clockStyle = snapStyle;
+      resetClockAnimationState();
+    }
+    manualClockMode = snapManual;
+    httpForceViz = snapViz;
+    gameModeStart();
+    Serial.println("Touch button: Triple tap -> game mode");
+    return;
+  }
+#endif
+  handleTouchTap();
+}
+#endif
+
+// Single source of truth for mode precedence. The visualizer outranks both
+// stats and clock: it is only ever on because something explicitly asked for
+// it, and it stops asking on its own once the stream dies.
+DisplayMode currentDisplayMode() {
+#if GAMEPAD_ENABLED
+  if (gameModeActive()) return MODE_GAME;
+#endif
+  if (httpForceViz && vizShouldDisplay()) return MODE_VIZ;
+#if TOUCH_BUTTON_ENABLED
+  if (metricData.online && !manualClockMode && !httpForceClock) return MODE_METRICS;
+#else
+  if (metricData.online && !httpForceClock) return MODE_METRICS;
+#endif
+  return MODE_CLOCK;
+}
+
 // Returns optimal refresh rate in Hz based on current display mode
 int getOptimalRefreshRate() {
+  // Checked before the manual-rate override: the visualizer is a transient,
+  // explicitly requested mode, and a manual 2 Hz parked for burn-in reasons
+  // should not freeze the bars. Capped rather than free-running - these
+  // controllers have no double buffering, so pushing frames faster than the
+  // panel scans them out shows up as tearing.
+  DisplayMode mode = currentDisplayMode();
+  if (mode == MODE_VIZ) {
+    return settings.vizRefreshHz;
+  }
+#if GAMEPAD_ENABLED
+  if (mode == MODE_GAME) return GAME_REFRESH_HZ;
+#endif
+
   if (settings.refreshRateMode == 1) {
     // Manual mode - use user-specified rate
     return settings.refreshRateHz;
@@ -168,7 +360,9 @@ int getOptimalRefreshRate() {
          settings.clockStyle == 4 || settings.clockStyle == 5 ||
          settings.clockStyle == 6 || settings.clockStyle == 7 ||
          settings.clockStyle == 8 || settings.clockStyle == 9 ||
-         settings.clockStyle == 10 || settings.clockStyle == 11)) {
+         settings.clockStyle == 10 || settings.clockStyle == 11 ||
+         settings.clockStyle == 16 || settings.clockStyle == 18 ||
+         settings.clockStyle == 19)) {
       return 60; // Instant boost for smooth manual clock mode
     }
 #endif
@@ -183,8 +377,10 @@ int getOptimalRefreshRate() {
         settings.clockStyle == 4 || settings.clockStyle == 5 ||
         settings.clockStyle == 6 || settings.clockStyle == 7 ||
         settings.clockStyle == 8 || settings.clockStyle == 9 ||
-        settings.clockStyle == 10 || settings.clockStyle == 11) {
-      // Animated clocks (Mario, Space Invaders, Space Ship, Pong, Pac-Man, Snake, Tetris, Cycle, Asteroids, Dino)
+        settings.clockStyle == 10 || settings.clockStyle == 11 ||
+        settings.clockStyle == 14 || settings.clockStyle == 16 ||
+        settings.clockStyle == 18 || settings.clockStyle == 19) {
+      // Animated clocks (Mario, Space Invaders, Space Ship, Pong, Pac-Man, Snake, Tetris, Cycle, Asteroids, Dino, Weather, TRON, Life, Dragon Ball)
       return 20; // 20 Hz keeps character movement smooth
     } else {
       // Static clocks (Standard, Large)
@@ -196,59 +392,75 @@ int getOptimalRefreshRate() {
   }
 }
 
-// --- Clock screen cycle state ---
-int lastMinuteBlock = -1;
-int currentScreen = 0;
-bool firstTimeSynced = false;
+// --- Clock screen rotation ---
+// The rotation is a list of style:seconds pairs the user orders in the web UI,
+// so durations are elapsed time rather than wall-clock 5-minute blocks.
+#include "clocks/cycle_config.h"
 
 // Animated clocks fire their minute-change animation at :56 and it runs on into
-// the next minute, so switching screens the instant the 5-minute block rolls
-// over clipped the animation every single time. Hold the switch back a few
-// seconds and let it land first.
-const int CYCLE_MIN_SEC = 10;  // grace for the outgoing animation to finish
-const int CYCLE_MAX_SEC = 30;  // cap so a stuck override can never wedge the cycle
+// the next minute, so switching the instant a duration expires clipped the
+// animation. Hold the switch back while one is in flight. The cap counts from the
+// animation's own start, not from the end of the duration: an hour change runs
+// 10-20 s on Tetris, Dino and Snake (32 s for Snake at its slowest), and a stuck
+// animation still can't wedge the rotation.
+const uint32_t CYCLE_ANIM_MAX_MS = 45000;
 
 void cycleClockScreens() {
-    struct tm timeinfo;
+    static char previous[sizeof(settings.cycleConfig)] = "";
+    static CycleEntry entries[CYCLE_COUNT];
+    static unsigned index = 0;
+    static uint32_t started = 0, lastRendered = 0;
+    static int lastStyle = -1;
 
-    // Advance the cycle only when we have valid time. When time is not yet
-    // available the per-screen draw functions below render their own
-    // "Syncing time..." message, so the display is never left blank.
-    if (getTimeWithTimeout(&timeinfo)) {
-        // Determine which 5-minute block we are in
-        int minuteBlock = timeinfo.tm_min / 5;
+    uint32_t now = millis();
 
-        // First valid time -> initialize block WITHOUT advancing screen
-        if (!firstTimeSynced) {
-            lastMinuteBlock = minuteBlock;
-            firstTimeSynced = true;
-        }
+    // Reparse when the config changes, and when the rotation was not the active
+    // renderer for a while - leaving and re-entering style 9 restarts it.
+    if (strcmp(previous, settings.cycleConfig) || now - lastRendered > 2000) {
+        if (!parseCycleConfig(settings.cycleConfig, entries))
+            parseCycleConfig(CYCLE_DEFAULT, entries);
+        strcpy(previous, settings.cycleConfig);
+        index = 0;
+        started = now;
+    }
+    lastRendered = now;
 
-        // After that, normal cycling. The block change is not consumed until
-        // the switch actually happens, so the condition simply stays true until
-        // the grace window opens. time_overridden covers every animated style
-        // except Pong, whose transition is long finished by CYCLE_MIN_SEC.
-        if (minuteBlock != lastMinuteBlock &&
-            timeinfo.tm_sec >= CYCLE_MIN_SEC &&
-            (!time_overridden || timeinfo.tm_sec >= CYCLE_MAX_SEC)) {
-            lastMinuteBlock = minuteBlock;
-            currentScreen = (currentScreen + 1) % 10; // Cycle through all 10 clock styles
-            resetClockAnimationState(); // Reset animation state when changing screens
-        }
+    uint32_t elapsed = now - started;
+    bool animating = time_overridden && now - time_override_start < CYCLE_ANIM_MAX_MS;
+    if (entries[index].seconds && elapsed >= entries[index].seconds * 1000UL && !animating) {
+        index = (index + 1) % CYCLE_COUNT;
+        started = now;
     }
 
-    // Draw the current screen (each draw function handles the no-time case)
-    switch (currentScreen) {
-        case 0: displayStandardClock(); break;
-        case 1: displayClockWithMario(); break;
-        case 2: displayClockWithSpaceInvader(); break;
-        case 3: displayLargeClock(); break;
-        case 4: displayClockWithPong(); break;
-        case 5: displayClockWithPacman(); break;
-        case 6: displayClockWithSnake(); break;
-        case 7: displayClockWithTetris(); break;
-        case 8: displayClockWithAsteroids(); break;
-        case 9: displayClockWithDino(); break;
+    // Skip disabled entries, and weather until a location is set.
+    // parseCycleConfig guarantees at least one is enabled.
+    for (unsigned n = 0; n < CYCLE_COUNT && (!entries[index].seconds ||
+         (entries[index].style == WEATHER_STYLE_ID && !weatherConfigured())); ++n) {
+        index = (index + 1) % CYCLE_COUNT;
+        started = now;
+    }
+
+    if (lastStyle != entries[index].style) {
+        resetClockAnimationState();
+        lastStyle = entries[index].style;
+    }
+
+    // Each draw function handles the no-time case with its own message.
+    switch (entries[index].style) {
+        case 0: displayClockWithMario(); break;
+        case 1: displayStandardClock(); break;
+        case 2: displayLargeClock(); break;
+        case 3: displayClockWithSpaceInvader(); break;
+        case 5: displayClockWithPong(); break;
+        case 6: displayClockWithPacman(); break;
+        case 7: displayClockWithSnake(); break;
+        case 8: displayClockWithTetris(); break;
+        case 10: displayClockWithAsteroids(); break;
+        case 11: displayClockWithDino(); break;
+        case 14: displayClockWithWeather(); break;
+        case 16: displayClockWithTron(); break;
+        case 18: displayClockWithLife(); break;
+        case 19: displayClockWithDragonBall(); break;
     }
 }
 
@@ -308,13 +520,13 @@ void setup() {
     if (tryConnectSavedWiFi()) {
       // Saved credentials worked — set up UDP + mDNS directly (skip WiFiManager)
       WiFi.setTxPower(WIFI_STA_TX_POWER);
-      udp.begin(UDP_PORT);
+      beginStatsUdp();
       initMDNS();
       bleHandled = true;
     } else if (runBleProvisioning()) {
       // BLE provisioning succeeded — WiFi already connected inside runBleProvisioning()
       WiFi.setTxPower(WIFI_STA_TX_POWER);
-      udp.begin(UDP_PORT);
+      beginStatsUdp();
       initMDNS();
       bleHandled = true;
     }
@@ -388,6 +600,8 @@ void loop() {
   // Handle web server requests
   server.handleClient();
 
+  weatherLoop();
+
   // Handle UDP packets - always process to track PC online status accurately
   handleUDP();
 
@@ -396,39 +610,9 @@ void loop() {
 #if LED_PWM_ENABLED
   handleTouchLED(); // Hold > 1s: ramp LED brightness up/down
 #endif
-  // Regular short press (mode toggle / clock style cycle)
-  if (checkTouchButtonPressed()) {
-    if (!handleTemporaryDisplayWake()) {
-      if (manualClockMode) {
-        // Check if PC is currently online (UDP is always processed, so status is accurate)
-        if (metricData.online) {
-          // PC is online - exit manual clock mode to show PC metrics
-          manualClockMode = false;
-          Serial.println("Touch button: Exiting manual clock mode (PC is online)");
-        } else {
-          // PC is offline (timeout triggered) - cycle through clock styles
-          settings.clockStyle = (settings.clockStyle + 1) % 13;
-          // Skip reserved clock style 4
-          if (settings.clockStyle == 4) settings.clockStyle = 5;
-          resetClockAnimationState();
-          Serial.print("Touch button: PC offline, cycling clock style -> ");
-          Serial.println(settings.clockStyle);
-        }
-      } else if (metricData.online) {
-        // PC is online - enter manual clock mode
-        manualClockMode = true;
-        Serial.println("Touch button: Entering manual clock mode (PC is online)");
-      } else {
-        // PC is offline - cycle through clock styles
-        settings.clockStyle = (settings.clockStyle + 1) % 12;
-        // Skip reserved clock style 4
-        if (settings.clockStyle == 4) settings.clockStyle = 5;
-        resetClockAnimationState();
-        Serial.print("Touch button: Clock style -> ");
-        Serial.println(settings.clockStyle);
-      }
-    }
-  }
+  // Taps: 1-2 step modes / clock styles, 3 start game mode, any leaves it
+  pollTouchTaps();
+  flushTouchStyleSave();
 #endif
 
   // Check timeout
@@ -491,23 +675,36 @@ void loop() {
   int targetHz = getOptimalRefreshRate();
   unsigned long frameInterval = 1000 / targetHz;
 
+  static bool clockWasShown = false;
+  if (!displayAvailable || isDisplayForcedOff()) clockWasShown = false;
+
   if (millis() >= nextDisplayUpdate && displayAvailable && !isDisplayForcedOff()) {
     nextDisplayUpdate = millis() + frameInterval;
 
     display.clearDisplay();
 
-#if TOUCH_BUTTON_ENABLED
-    bool showStats = metricData.online && !manualClockMode && !httpForceClock;
-#else
-    bool showStats = metricData.online && !httpForceClock;
-#endif
+    DisplayMode mode = currentDisplayMode();
+    bool showStats = mode == MODE_METRICS;
 
     // Show error status if PC is connected but LHM has issues
-    if (showStats && metricData.status != STATUS_OK && metricData.status != 0) {
+    if (mode == MODE_GAME) {
+#if GAMEPAD_ENABLED
+      displayGameMode();
+#endif
+    } else if (mode == MODE_VIZ) {
+      displayVisualizer();
+    } else if (showStats && metricData.status != STATUS_OK && metricData.status != 0) {
       displayErrorStatus(metricData.status);
     } else if (showStats) {
       displayStats();
     } else {
+      // The clocks only advance displayed_hour/min while they are drawn, so
+      // coming back from stats/viz/display-off they hold a stale time.
+      if (!clockWasShown) {
+        resetClockAnimationState();
+        struct tm now_tm;
+        if (peekLocalTime(&now_tm)) syncDisplayedTime(&now_tm);
+      }
       switch (settings.clockStyle) {
       case 0:
         displayClockWithMario();
@@ -543,7 +740,19 @@ void loop() {
       case 11:
         displayClockWithDino();
         break;
-      case 12:
+      case 14:
+        displayClockWithWeather();
+        break;
+      case 16:
+        displayClockWithTron();
+        break;
+      case 18:
+        displayClockWithLife();
+        break;
+      case 19:
+        displayClockWithDragonBall();
+        break;
+      case 20:
         displayClockWithLogo();
         break;
       default:
@@ -551,8 +760,26 @@ void loop() {
         break;
       }
     }
+    clockWasShown = mode == MODE_CLOCK;
 
     display.display();
+
+#if VIZ_DEBUG_FB
+    // Frames actually pushed to the panel over the last second. The frame loop
+    // is bus-limited, so the configured refresh rate is an upper bound and not
+    // a promise - this is the only honest way to know what the panel does.
+    {
+      static unsigned long fpsWindowStart = 0;
+      static uint16_t fpsFrames = 0;
+      fpsFrames++;
+      unsigned long nowMs = millis();
+      if (nowMs - fpsWindowStart >= 1000) {
+        measuredFps = fpsFrames * 1000.0f / (nowMs - fpsWindowStart);
+        fpsFrames = 0;
+        fpsWindowStart = nowMs;
+      }
+    }
+#endif
   }
 
   // WiFi reconnection handling

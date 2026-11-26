@@ -490,16 +490,30 @@ fetch('/metrics').then(function (r) { return r.json(); })
 }
 reloadMetrics(true);
 setInterval(pollMetrics, 1500);
+// The connection fields sit outside cfgForm, so the form POST cannot carry
+// them. Save those first: the layout push is addressed to the IP and port they
+// set, so doing it the other way round pushes to the previous device.
 form.addEventListener('submit', function (e) {
 e.preventDefault();
 saveFormState();
 var btn = $('#saveBtn'); var orig = btn.textContent;
 btn.disabled = true; btn.textContent = 'Saving...';
+function done() { btn.disabled = false; btn.textContent = orig; }
+saveConnection().then(function (c) {
+if (!c.success) {
+// Show the complaint next to the field that caused it, not on whichever
+// page the save was triggered from.
+done(); showPage('connection');
+setConnResult(c.message || 'Could not save connection settings.', false);
+return null;
+}
+setConnResult(connectionSavedText(c), true); refreshStatus();
 var body = new URLSearchParams(new FormData(form));
-fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
-.then(function (r) { return r.json(); })
-.then(function (d) {
-btn.disabled = false; btn.textContent = orig;
+return fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+.then(function (r) { return r.json(); });
+}).then(function (d) {
+if (!d) return;
+done();
 if (d.success) {
 markClean('Saved');
 if (d.networkChanged) {
@@ -508,7 +522,7 @@ setTimeout(function () { window.location.href = '/'; }, 3000);
 }
 } else { alert('Error saving settings.'); }
 })
-.catch(function (err) { btn.disabled = false; btn.textContent = orig; alert('Error saving settings: ' + err); });
+.catch(function (err) { done(); alert('Error saving settings: ' + err); });
 });
 // pywebview bridge (present only inside the native window); browser uses fallbacks.
 function nativeApi() { return (window.pywebview && window.pywebview.api) ? window.pywebview.api : null; }
@@ -562,7 +576,7 @@ var revertBtn = $('#revertBtn');
 if (revertBtn) revertBtn.addEventListener('click', function () {
 if (!confirm('Discard unsaved changes and reload the last saved configuration?')) return;
 fetch('/api/revert', { method: 'POST' }).then(function (r) { return r.json(); }).then(function (d) {
-if (d.success) reloadMetrics(true).then(function () { loadSensors(false); markClean('Reverted to saved'); refreshStatus(); });
+if (d.success) reloadMetrics(true).then(function () { loadSensors(false); hydrateConnection(); markClean('Reverted to saved'); refreshStatus(); });
 }).catch(function (err) { alert('Revert failed: ' + err); });
 });
 
@@ -602,8 +616,27 @@ if (title) title.textContent = (d.deviceReachable ? 'Device online' : 'Device of
 setText('srDevice', d.deviceIp || '-');
 setText('srSource', d.source || '-');
 setText('srCount', (d.metricCount || 0) + ' metric' + (d.metricCount === 1 ? '' : 's'));
+var avChk = $('#audio_viz'), avState = $('#audioVizState');
+// Only adopt the live value until the field has been hydrated once, so a poll
+// cannot overwrite an unsaved edit.
+if (avChk && !avHydrated && d.audioVizEnabled !== undefined) { avChk.checked = !!d.audioVizEnabled; avHydrated = true; }
+if (avState && d.audioVizAvailable !== undefined) {
+if (!d.audioVizAvailable) avState.textContent = 'Not available: install the audio packages first (pip install soundcard numpy).';
+else if (d.audioVizEnabled) avState.textContent = d.audioVizSending ? 'Streaming the sound spectrum to the display.' : 'Enabled - waiting for audio playback...';
+else avState.textContent = '';
+}
+var aaState = $('#audioVizAutoState');
+if (aaState && d.audioVizAvailable !== undefined) {
+if (!d.audioVizAvailable) aaState.textContent = '';
+else if (!d.audioVizEnabled) aaState.textContent = 'Turn on the stream above to use auto-start.';
+else if (!d.audioVizAuto) aaState.textContent = 'Auto-start off - switch the display from its Audio visualizer page.';
+else aaState.textContent = (d.audioVizForced ? 'Visualizer running (started by playback). ' : 'Waiting for playback. ')
++ 'Current level: ' + (d.audioVizLevel != null ? d.audioVizLevel : '?') + ' dB.'
++ (d.audioVizAutoError ? ' Last switch failed: ' + d.audioVizAutoError : '');
+}
 }).catch(function () {});
 }
+var avHydrated = false;
 
 // ---- PC companion: connection settings ----------------------------------
 // Fill the connection fields from the saved config so they reflect what is
@@ -613,6 +646,11 @@ fetch('/api/info').then(function (r) { return r.json(); }).then(function (d) {
 var ip = $('#esp32_ip'); if (ip && d.ip) ip.value = d.ip;
 var port = $('#udp_port'); if (port && d.udp_port != null) port.value = d.udp_port;
 var iv = $('#update_interval'); if (iv && d.update_interval != null) iv.value = d.update_interval;
+var av = $('#audio_viz'); if (av && d.audio_viz != null) { av.checked = !!d.audio_viz; avHydrated = true; }
+var aa = $('#audio_viz_auto'); if (aa && d.audio_viz_auto != null) aa.checked = !!d.audio_viz_auto;
+var th = $('#audio_viz_threshold'); if (th && d.audio_viz_threshold != null) th.value = d.audio_viz_threshold;
+var sd = $('#audio_viz_start_delay'); if (sd && d.audio_viz_start_delay != null) sd.value = d.audio_viz_start_delay;
+var qd = $('#audio_viz_stop_delay'); if (qd && d.audio_viz_stop_delay != null) qd.value = d.audio_viz_stop_delay;
 // Only the Windows core has two sensor sources to choose between.
 var sf = $('#sourceField'); if (sf) sf.style.display = d.source_select ? '' : 'none';
 var ss = $('#sensor_source'); if (ss && d.sensor_source) ss.value = d.sensor_source;
@@ -625,29 +663,28 @@ connResult.textContent = msg;
 connResult.className = 'note ' + (ok ? '' : 'warn');
 connResult.style.display = msg ? '' : 'none';
 }
-var saveConnBtn = $('#saveConnBtn');
-if (saveConnBtn) saveConnBtn.addEventListener('click', function () {
+function saveConnection() {
 var body = new URLSearchParams();
 body.set('esp32_ip', ($('#esp32_ip') || {}).value || '');
 body.set('udp_port', ($('#udp_port') || {}).value || '');
 body.set('update_interval', ($('#update_interval') || {}).value || '');
 var srcSel = $('#sensor_source');
 if (srcSel) body.set('sensor_source', srcSel.value || 'auto');
-saveConnBtn.disabled = true;
-fetch('/api/connection', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
-.then(function (r) { return r.json(); }).then(function (d) {
-saveConnBtn.disabled = false;
-if (d.success) {
-markClean('Connection saved');
+body.set('audio_viz', ($('#audio_viz') || {}).checked ? '1' : '0');
+body.set('audio_viz_auto', ($('#audio_viz_auto') || {}).checked ? '1' : '0');
+body.set('audio_viz_threshold', ($('#audio_viz_threshold') || {}).value || '-45');
+body.set('audio_viz_start_delay', ($('#audio_viz_start_delay') || {}).value || '3');
+body.set('audio_viz_stop_delay', ($('#audio_viz_stop_delay') || {}).value || '20');
+return fetch('/api/connection', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+.then(function (r) { return r.json(); });
+}
+function connectionSavedText(d) {
 var msg = 'Saved. Device set to ' + d.esp32_ip + ':' + d.udp_port + ', every ' + d.update_interval + 's.';
 // Say which source we landed on: "auto" resolves at save time, and a forced
 // choice that can't be honoured is worth surfacing rather than hiding.
 if (d.resolved_source) msg += ' Reading sensors via ' + d.resolved_source.toUpperCase() + '.';
-setConnResult(msg, true); refreshStatus();
+return msg;
 }
-else { setConnResult(d.message || 'Could not save connection settings.', false); }
-}).catch(function (err) { saveConnBtn.disabled = false; setConnResult('Error: ' + err, false); });
-});
 var testConnBtn = $('#testConnBtn');
 if (testConnBtn) testConnBtn.addEventListener('click', function () {
 var ip = ($('#esp32_ip') || {}).value || '';
@@ -787,6 +824,14 @@ if (sensorSearch) sensorSearch.addEventListener('input', applySensorFilter);
 var sensorsNav = document.querySelector('.nav-item[data-nav="sensors"]');
 if (sensorsNav) sensorsNav.addEventListener('click', function () { loadSensors(false); });
 
+// cfgForm's own input/change listeners cannot see these, so without this the
+// bar reports "All saved" while connection edits are still pending.
+['esp32_ip', 'udp_port', 'update_interval', 'sensor_source', 'audio_viz',
+'audio_viz_auto', 'audio_viz_threshold', 'audio_viz_start_delay',
+'audio_viz_stop_delay'].forEach(function (id) {
+var el = $('#' + id);
+if (el) { el.addEventListener('input', markDirty); el.addEventListener('change', markDirty); }
+});
 hydrateConnection();
 refreshStatus();
 refreshAutostart();

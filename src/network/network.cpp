@@ -8,6 +8,7 @@
 #include "../display/display.h"
 #include "../utils/utils.h"
 #include "../timezones.h"
+#include "../viz/visualizer.h"
 #include "improv_setup.h"
 #include <Preferences.h>
 
@@ -225,9 +226,7 @@ void initNetwork() {
   WiFi.setTxPower(WIFI_STA_TX_POWER);
 
   // Start UDP listener
-  udp.begin(UDP_PORT);
-  Serial.print("UDP listening on port ");
-  Serial.println(UDP_PORT);
+  beginStatsUdp();
 
   // Start mDNS for app discovery
   initMDNS();
@@ -346,14 +345,20 @@ void handleWiFiReconnection() {
       wifiDisconnectTime = 0;
       ntpSynced = false;  // Force NTP resync after reconnection
       applyTimezone();    // Restart SNTP client and reapply timezone
-      udp.stop();         // Re-initialize UDP socket (old fd is stale)
-      udp.begin(UDP_PORT);
+      beginStatsUdp();    // Re-initialize UDP socket (old fd is stale)
       initMDNS();         // Re-register mDNS after reconnection
     }
   }
 }
 
 // ========== UDP Packet Handling ==========
+void beginStatsUdp() {
+  udp.stop();
+  udp.begin(settings.udpPort);
+  Serial.print("UDP listening on port ");
+  Serial.println(settings.udpPort);
+}
+
 void handleUDP() {
   int packetSize = udp.parsePacket();
   if (packetSize) {
@@ -370,6 +375,16 @@ void handleUDP() {
     int len = udp.read(buffer, sizeof(buffer) - 1);
     if (len > 0) {
       buffer[len] = '\0';
+
+      // Binary spectrum packets ("FFT1" + 32 bands, optionally + 128 waveform
+      // samples) arrive at ~25 Hz - take the fast path with no JSON parse and
+      // no serial logging. Returning here is not an optimisation: lastReceived
+      // below is stamped unconditionally, so falling through would keep
+      // metricData.online true for as long as music is playing, and the device
+      // would show stale stats long after the PC went away.
+      if (vizIngest((const uint8_t *)buffer, len)) {
+        return;
+      }
 
       Serial.print("UDP packet: ");
       Serial.print(packetSize);

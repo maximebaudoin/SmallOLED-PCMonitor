@@ -12,7 +12,7 @@
 #include "user_config.h"
 
 // ========== Version ==========
-#define FIRMWARE_VERSION "1.6.4-rc1"
+#define FIRMWARE_VERSION "1.9.0"
 
 // ========== Constants ==========
 #define MAX_METRICS 20
@@ -55,7 +55,8 @@ struct MetricData {
 // ========== Settings Structure ========== 
 struct Settings {
   // Clock settings
-  uint8_t clockStyle;       // 0=Mario, 1=Standard, 2=Large, 3=Space Invader, 4=Space Ship, 5=Pong, 6=Pac-Man, 7=Snake, 8=Tetris, 9=Cycle All, 10=Asteroids, 11=Dino Runner, 12=Logo
+  uint8_t clockStyle;       // 0=Mario, 1=Standard, 2=Large, 3=Space Invader, 4=Space Ship, 5=Pong, 6=Pac-Man, 7=Snake, 8=Tetris, 9=Custom rotation, 10=Asteroids, 11=Dino Runner, 16=TRON, 18=Game of Life, 19=Dragon Ball, 20=Logo
+  char cycleConfig[128];    // Ordered style:seconds pairs used by style 9; 0 seconds disables
   int16_t gmtOffset;        // GMT offset in minutes (deprecated, kept for migration)
   bool daylightSaving;      // DST enabled (deprecated, kept for migration)
   char timezoneString[64];  // POSIX TZ string (e.g., "CET-1CEST,M3.5.0/02:00,M10.5.0/03:00")
@@ -67,7 +68,6 @@ struct Settings {
   bool showClock;           // Show clock in metrics mode
 
   // Display settings
-  uint8_t displayType;      // 0=SSD1306, 1=SH1106
   uint8_t displayRowMode;   // 0=5 rows, 1=6 rows, 2=Large 2-row, 3=Large 3-row
   uint8_t colonBlinkMode;   // 0=Always On, 1=Blink, 2=Always Off
   uint8_t colonBlinkRate;   // Tenths of Hz (10 = 1.0 Hz)
@@ -88,6 +88,11 @@ struct Settings {
   uint8_t ledBrightness;        // LED brightness 0-255 (default: 128 = 50%)
 #endif
 
+  // Touch button
+#if TOUCH_BUTTON_ENABLED
+  uint8_t touchButtonPin;       // GPIO carrying the TTP223 signal (default: TOUCH_BUTTON_PIN)
+#endif
+
   // Format options
   bool useRpmKFormat;       // Show RPM as K (e.g., 1.2K instead of 1200)
   bool useNetworkMBFormat;  // Show network as MB/s instead of KB/s
@@ -101,6 +106,7 @@ struct Settings {
   char subnet[16];
   char dns1[16];
   char dns2[16];
+  uint16_t udpPort;             // Stats listener port (default: UDP_PORT, 4210)
   char ntpServer1[64];          // Primary NTP server (default: pool.ntp.org)
   char ntpServer2[64];          // Secondary NTP server (default: time.nist.gov, may be empty)
 
@@ -160,11 +166,52 @@ struct Settings {
   bool asteroidsShowDate;       // Show date row (off = centred clock)
   bool asteroidsTransparent;    // No mask behind digits, ship flies through (default: true)
 
+  // TRON clock settings
+  uint8_t tronBikeStyle;        // 0=Side profile, 1=Overhead
+  bool tronShowGrid;            // Arena floor grid dots
+  bool tronShowBorder;          // Arena boundary rectangle
+
+  // Audio visualizer settings (forced mode, not a clock style)
+  uint8_t vizStyle;             // 0=Classic EQ, 1=Oscilloscope, 2=Mirror EQ
+  uint8_t vizRefreshHz;         // Frame rate cap while the visualizer is up (15-60)
+  uint8_t vizBarStyle;          // 0=Solid, 1=Segmented, 2=Outline
+  bool vizPeakDots;             // Peak-hold marker above each bar
+  uint8_t vizSilenceTimeout;    // Seconds of silence before the visualizer steps aside (0 = never)
+  bool vizShowClock;            // Small HH:MM overlay in the top-right corner
+  bool scopeGrid;               // Oscilloscope: draw the graticule
+  bool scopeFill;               // Oscilloscope: fill to the centre line
+  uint8_t scopeTrail;           // Oscilloscope: ghost trace (0=off, 1=on)
+  uint8_t scopeGain;            // Oscilloscope: trace height percent (50-200)
+
   // Dino Runner clock settings
   uint8_t dinoSpeed;            // World scroll speed, tenths (12 = 1.2)
   uint8_t dinoCactusFreq;       // 0=Rare, 1=Normal, 2=Frequent
   bool dinoShowClouds;          // Parallax clouds (default: true)
   bool dinoShowDate;            // Show date row (off = centred clock)
+
+  // Game of Life clock settings
+  uint8_t lifeSpeed;            // Generations per second (2-20)
+  uint8_t lifeDensity;          // 0=Sparse, 1=Normal, 2=Dense
+  bool lifeShowDate;            // Show date row (off = centred clock)
+  bool lifeSmallClock;          // Size-2 digits on a finer grid, more room for the colony
+  bool lifeSmallCells;          // 2px colony cells with the large clock (small clock always uses them)
+  uint8_t lifeClockPos;         // Small clock only: 0=Centre, 1=Top, 2=Bottom
+
+  // Game mode
+  uint8_t gameIdleExitMin;      // Leave game mode after this many minutes without input (0 = never)
+  bool gameRumble;              // Pad vibration on game events (default: true)
+  uint8_t blocksStartLevel;     // Falling Blocks starting level (1-10)
+  bool blocksStickDrop;         // Left stick up hard-drops too (d-pad up always does)
+  bool blocksGhost;             // Falling Blocks landing preview (default off)
+
+  // Dragon Ball clock settings
+  bool dragonIdleTricks;        // Afterimage teleports and power-ups between minutes
+
+  // Weather clock (style 14, Open-Meteo)
+  float weatherLat;             // Location latitude (0,0 = unset)
+  float weatherLon;             // Location longitude
+  bool weatherUseFahrenheit;    // false = Celsius (and km/h)
+  uint8_t weatherLayout;        // 0=Classic; forecast on the right: 1=day rows, 2=day columns, 3=next 12 hours, 4=tomorrow
 
   // Metric configuration arrays
   char metricLabels[MAX_METRICS][METRIC_NAME_LEN];
@@ -178,6 +225,23 @@ struct Settings {
   int metricBarWidths[MAX_METRICS];
   int metricBarOffsets[MAX_METRICS];
 };
+
+// ========== Display Mode ==========
+// What the panel is showing right now. Rendering and /api/status must agree,
+// so the precedence lives in exactly one place (currentDisplayMode() in
+// main.cpp) instead of being spelled out at each call site.
+enum DisplayMode {
+  MODE_GAME,     // Game mode (gamepad pairing / game)
+  MODE_VIZ,     // Audio visualizer (forced, and actually fed or in grace)
+  MODE_METRICS,  // PC stats
+  MODE_CLOCK,    // Clock / screensaver
+};
+
+DisplayMode currentDisplayMode();
+
+// Selectable clock style ids (sparse - see CLOCK_STYLES in main.cpp).
+bool isValidClockStyle(uint8_t id);
+uint8_t nextClockStyle(uint8_t current);
 
 // ========== Mario Clock Types ==========
 enum MarioState {

@@ -13,11 +13,16 @@ REM
 REM  Notes:
 REM   * --windowed  -> no console window flashes at login (this is a background
 REM                    app that lives in the system tray). print() output is
-REM                    redirected to %APPDATA%\PCStatsMonitor\monitor.log.
+REM                    redirected to %APPDATA%\SmallOLED-Companion\monitor.log.
+REM   * --icon icon.ico is the portal's brand mark, regenerated with
+REM     'python ..\companion-common\brand_icon.py'.
 REM   * --add-data "webui;webui" bundles the web UI (index.html/portal.css/js).
 REM     At runtime server.webui_dir() resolves it from sys._MEIPASS.
 REM   * --collect-all webview / pythonnet pulls in the pywebview EdgeChromium
 REM     (WebView2) backend, which PyInstaller can't see (loaded via clr).
+REM   * --collect-all soundcard / numpy bundles the optional audio-visualizer
+REM     stream so it works from the .exe without a separate pip install
+REM     (soundcard's native loopback backend is otherwise missed).
 REM   * The other hidden-imports cover lazily-imported wmi / pystray / PIL /
 REM     pywin32 modules.
 REM   * WebView2 runtime is required on the target PC (ships with Windows 11;
@@ -51,6 +56,7 @@ if exist dist  rmdir /s /q dist
   --onefile ^
   --windowed ^
   --name pc_stats_monitor_v4 ^
+  --icon icon.ico ^
   --splash splash.png ^
   --paths "..\companion-common" ^
   --add-data "..\companion-common\webui;webui" ^
@@ -58,10 +64,15 @@ if exist dist  rmdir /s /q dist
   --hidden-import app_window ^
   --hidden-import app_state ^
   --hidden-import layout_engine ^
+  --hidden-import audio_spectrum ^
+  --hidden-import app_paths ^
+  --hidden-import brand_icon ^
   --collect-all webview ^
   --collect-all pythonnet ^
   --collect-all pystray ^
   --collect-all PIL ^
+  --collect-all soundcard ^
+  --collect-all numpy ^
   --hidden-import clr ^
   --hidden-import wmi ^
   --hidden-import pythoncom ^

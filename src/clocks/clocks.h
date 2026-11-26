@@ -13,6 +13,8 @@
 
 // Get time with timeout (defined in main.cpp)
 bool getTimeWithTimeout(struct tm* timeinfo, unsigned long timeout_ms = 100);
+// Single non-blocking read - use in render paths instead of a 0ms timeout.
+bool peekLocalTime(struct tm* info);
 
 // Animation detection for adaptive refresh rate
 bool isAnimationActive();
@@ -120,9 +122,31 @@ bool tetrisIsAnimating();
 void displayClockWithAsteroids();
 void resetAsteroidsAnimation();
 
+// ========== TRON Clock ==========
+void displayClockWithTron();
+void resetTronAnimation();
+bool tronIsAnimating();
+
 // ========== Dino Runner Clock ==========
 void displayClockWithDino();
 void resetDinoAnimation();
+
+// ========== Weather Clock ==========
+void displayClockWithWeather();
+
+// ========== Game of Life Clock ==========
+void displayClockWithLife();
+void resetLifeAnimation();
+bool lifeIsAnimating();
+
+// ========== Dragon Ball Clock ==========
+void displayClockWithDragonBall();
+void resetDragonBallAnimation();
+bool dragonBallIsAnimating();
+// Demo: play every act in turn (only = -1), one act (0..acts-1), or stop (-2).
+// When it ends, clockStyle and the forced-clock flag go back to prevStyle/prevForce.
+void dragonBallStartDemo(int only, int prevStyle = -1, bool prevForce = false);
+int dragonBallDemoActs();
 
 // ========== Logo Clock ==========
 void displayClockWithLogo();

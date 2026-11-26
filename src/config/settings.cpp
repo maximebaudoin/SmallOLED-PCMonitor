@@ -7,6 +7,8 @@
 #include "settings.h"
 #include "../config/config.h"
 #include "../timezones.h"
+#include "../utils/utils.h"
+#include "../clocks/cycle_config.h"
 #include <Preferences.h>
 
 
@@ -40,6 +42,7 @@ void loadSettings() {
     Serial.println("WARNING: Failed to open preferences, using defaults");
     // Initialize with defaults
     settings.clockStyle = 0;
+    strcpy(settings.cycleConfig, CYCLE_DEFAULT);
     settings.gmtOffset = 60;  // GMT+1 (Central European)
     settings.daylightSaving = true;
     strcpy(settings.timezoneString, "CET-1CEST,M3.5.0/02:00,M10.5.0/03:00"); // Default: Central European
@@ -59,6 +62,9 @@ void loadSettings() {
     settings.boostAnimationRefresh =
         true;                        // Default: Enable smooth animation boost
     settings.displayBrightness = sanitizeBrightnessValue(255);
+#if TOUCH_BUTTON_ENABLED
+    settings.touchButtonPin = TOUCH_BUTTON_PIN;
+#endif
     settings.enableScheduledDimming = false;
     settings.dimStartHour = 22;
     settings.dimEndHour = 7;
@@ -153,6 +159,15 @@ void loadSettings() {
   }
 
   settings.clockStyle = preferences.getInt("clockStyle", 0); // Default: Mario
+
+  // An unparsable rotation - hand-edited, or written by a firmware whose style
+  // list has since changed beyond repair - falls back to the stock order.
+  strcpy(settings.cycleConfig, CYCLE_DEFAULT);
+  String cycle = preferences.getString("cycleConfig", CYCLE_DEFAULT);
+  CycleEntry checkedCycle[CYCLE_COUNT];
+  if (cycle.length() < sizeof(settings.cycleConfig) &&
+      parseCycleConfig(cycle.c_str(), checkedCycle))
+    strcpy(settings.cycleConfig, cycle.c_str());
 
   // gmtOffset migration: convert old hours to new minutes format
   int loadedOffset = preferences.getInt("gmtOffset", 60);
@@ -250,6 +265,18 @@ void loadSettings() {
   settings.ledEnabled = preferences.getBool("ledEnabled", false); // Default: Off
   settings.ledBrightness = preferences.getUChar("ledBright", 128); // Default: 50%
 #endif
+#if TOUCH_BUTTON_ENABLED
+  settings.touchButtonPin = preferences.getUChar("touchPin", TOUCH_BUTTON_PIN);
+  if (!isValidTouchPin(settings.touchButtonPin)) {
+    // A config imported from a different board revision, or a build whose pin
+    // assignments moved, can name a pin this firmware cannot use.
+    Serial.print("WARNING: saved touch pin GPIO ");
+    Serial.print(settings.touchButtonPin);
+    Serial.print(" is not usable, falling back to GPIO ");
+    Serial.println(TOUCH_BUTTON_PIN);
+    settings.touchButtonPin = TOUCH_BUTTON_PIN;
+  }
+#endif
   settings.marioBounceHeight =
       preferences.getUChar("marioBnceH", 35); // Default: 3.5
   settings.marioBounceSpeed =
@@ -334,6 +361,22 @@ void loadSettings() {
       preferences.getBool("astDate", false); // Default: hidden (centred clock)
   settings.asteroidsTransparent =
       preferences.getBool("astTransp", true); // Default: transparent digits
+  settings.tronBikeStyle = preferences.getUChar("tronBike", 0);
+  settings.tronShowGrid = preferences.getBool("tronGrid", true);
+  settings.tronShowBorder = preferences.getBool("tronBorder", true);
+
+  // Audio visualizer (NVS keys are <=15 chars)
+  settings.vizStyle = preferences.getUChar("vizStyle", 0);      // Classic EQ
+  settings.vizRefreshHz = preferences.getUChar("vizHz", 30);
+  settings.vizBarStyle = preferences.getUChar("vizBarStyle", 1); // Segmented
+  settings.vizPeakDots = preferences.getBool("vizPeak", true);
+  settings.vizSilenceTimeout = preferences.getUChar("vizQuiet", 10);
+  settings.vizShowClock = preferences.getBool("vizClock", true);
+  settings.scopeGrid = preferences.getBool("scopeGrid", false);
+  settings.scopeFill = preferences.getBool("scopeFill", false);
+  settings.scopeTrail = preferences.getUChar("scopeTrail", 1);
+  settings.scopeGain = preferences.getUChar("scopeGain", 100);
+
   settings.dinoSpeed =
       preferences.getUChar("dinoSpeed", 12); // Default: 1.2
   settings.dinoCactusFreq =
@@ -342,6 +385,23 @@ void loadSettings() {
       preferences.getBool("dinoClouds", true); // Default: clouds on
   settings.dinoShowDate =
       preferences.getBool("dinoDate", false); // Default: hidden (centred clock)
+  settings.lifeSpeed = preferences.getUChar("lifeSpeed", 8);
+  settings.gameIdleExitMin = preferences.getUChar("gameIdleExit", 5);
+  settings.gameRumble = preferences.getBool("gameRumble", true);
+  settings.blocksStartLevel = preferences.getUChar("blkStartLvl", 1);
+  settings.blocksStickDrop = preferences.getBool("blkStickDrop", true);
+  settings.blocksGhost = preferences.getBool("blkGhost", false);
+  settings.lifeDensity = preferences.getUChar("lifeDensity", 1);
+  settings.lifeShowDate = preferences.getBool("lifeDate", false);
+  settings.lifeSmallClock = preferences.getBool("lifeSmall", false);
+  settings.lifeSmallCells = preferences.getBool("lifeCells", false);
+  settings.lifeClockPos = preferences.getUChar("lifePos", 0);
+  settings.dragonIdleTricks = preferences.getBool("dbTricks", true);
+  settings.weatherLat = preferences.getFloat("weatherLat", 0);
+  settings.weatherLon = preferences.getFloat("weatherLon", 0);
+  settings.weatherUseFahrenheit = preferences.getBool("weatherF", false);
+  settings.weatherLayout = preferences.getUChar("weatherLay", 0);
+  if (settings.weatherLayout > 4) settings.weatherLayout = 0;
 
   bool brightnessSettingsSanitized = false;
   uint8_t sanitizedDisplayBrightness =
@@ -383,6 +443,8 @@ void loadSettings() {
   settings.dns2[15] = '\0';
 
   // NTP servers (custom, with defaults)
+  settings.udpPort = preferences.getUShort("udpPort", UDP_PORT);
+  if (settings.udpPort < 1024 || settings.udpPort == 80) settings.udpPort = UDP_PORT;
   String loadedNtp1 = preferences.getString("ntpServer1", "pool.ntp.org");
   String loadedNtp2 = preferences.getString("ntpServer2", "time.nist.gov");
   strncpy(settings.ntpServer1, loadedNtp1.c_str(), 63);
@@ -498,10 +560,25 @@ void loadSettings() {
   Serial.println("Settings loaded (v2.0 - Compact Grid Layout)");
 }
 
+// saveSettings() rewrites every key and blocks for ~220 ms.
+void saveClockStyle() {
+  preferences.begin("pcmonitor", false);
+  preferences.putInt("clockStyle", settings.clockStyle);
+  preferences.end();
+}
+
+void saveLedState() {
+  preferences.begin("pcmonitor", false);
+  preferences.putBool("ledEnabled", settings.ledEnabled);
+  preferences.putUChar("ledBright", settings.ledBrightness);
+  preferences.end();
+}
+
 void saveSettings() {
   sanitizeBrightnessSettings();
   preferences.begin("pcmonitor", false); // Read-write
   preferences.putInt("clockStyle", settings.clockStyle);
+  preferences.putString("cycleConfig", settings.cycleConfig);
   preferences.putInt("gmtOffset", settings.gmtOffset); // Keep for backward compatibility
   preferences.putBool("dst", settings.daylightSaving);  // Keep for backward compatibility
   preferences.putString("tz", settings.timezoneString); // New timezone string
@@ -527,6 +604,9 @@ void saveSettings() {
 #if LED_PWM_ENABLED
   preferences.putBool("ledEnabled", settings.ledEnabled);
   preferences.putUChar("ledBright", settings.ledBrightness);
+#endif
+#if TOUCH_BUTTON_ENABLED
+  preferences.putUChar("touchPin", settings.touchButtonPin);
 #endif
   preferences.putUChar("marioBnceH", settings.marioBounceHeight);
   preferences.putUChar("marioBnceS", settings.marioBounceSpeed);
@@ -570,10 +650,41 @@ void saveSettings() {
   preferences.putUChar("astRockSpd", settings.asteroidsRockSpeed);
   preferences.putBool("astDate", settings.asteroidsShowDate);
   preferences.putBool("astTransp", settings.asteroidsTransparent);
+  preferences.putUChar("tronBike", settings.tronBikeStyle);
+  preferences.putBool("tronGrid", settings.tronShowGrid);
+  preferences.putBool("tronBorder", settings.tronShowBorder);
+
+  preferences.putUChar("vizStyle", settings.vizStyle);
+  preferences.putUChar("vizHz", settings.vizRefreshHz);
+  preferences.putUChar("vizBarStyle", settings.vizBarStyle);
+  preferences.putBool("vizPeak", settings.vizPeakDots);
+  preferences.putUChar("vizQuiet", settings.vizSilenceTimeout);
+  preferences.putBool("vizClock", settings.vizShowClock);
+  preferences.putBool("scopeGrid", settings.scopeGrid);
+  preferences.putBool("scopeFill", settings.scopeFill);
+  preferences.putUChar("scopeTrail", settings.scopeTrail);
+  preferences.putUChar("scopeGain", settings.scopeGain);
+
   preferences.putUChar("dinoSpeed", settings.dinoSpeed);
   preferences.putUChar("dinoCactus", settings.dinoCactusFreq);
   preferences.putBool("dinoClouds", settings.dinoShowClouds);
   preferences.putBool("dinoDate", settings.dinoShowDate);
+  preferences.putUChar("lifeSpeed", settings.lifeSpeed);
+  preferences.putUChar("gameIdleExit", settings.gameIdleExitMin);
+  preferences.putBool("gameRumble", settings.gameRumble);
+  preferences.putUChar("blkStartLvl", settings.blocksStartLevel);
+  preferences.putBool("blkStickDrop", settings.blocksStickDrop);
+  preferences.putBool("blkGhost", settings.blocksGhost);
+  preferences.putUChar("lifeDensity", settings.lifeDensity);
+  preferences.putBool("lifeDate", settings.lifeShowDate);
+  preferences.putBool("lifeSmall", settings.lifeSmallClock);
+  preferences.putBool("lifeCells", settings.lifeSmallCells);
+  preferences.putUChar("lifePos", settings.lifeClockPos);
+  preferences.putBool("dbTricks", settings.dragonIdleTricks);
+  preferences.putFloat("weatherLat", settings.weatherLat);
+  preferences.putFloat("weatherLon", settings.weatherLon);
+  preferences.putBool("weatherF", settings.weatherUseFahrenheit);
+  preferences.putUChar("weatherLay", settings.weatherLayout);
 
   // Save network configuration
   preferences.putString("deviceName", settings.deviceName);
@@ -584,6 +695,7 @@ void saveSettings() {
   preferences.putString("subnet", settings.subnet);
   preferences.putString("dns1", settings.dns1);
   preferences.putString("dns2", settings.dns2);
+  preferences.putUShort("udpPort", settings.udpPort);
   preferences.putString("ntpServer1", settings.ntpServer1);
   preferences.putString("ntpServer2", settings.ntpServer2);
 

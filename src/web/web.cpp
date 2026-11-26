@@ -11,8 +11,15 @@
 #include "../network/network.h"
 #include "../utils/utils.h"
 #include "../clocks/clocks.h"
+#include "../clocks/cycle_config.h"
 #include "../display/display.h"
 #include "../timezones.h"
+#include "../viz/visualizer.h"
+#include "../weather/weather.h"
+#if GAMEPAD_ENABLED
+#include "../game/game_mode.h"
+#include "../game/game_common.h"
+#endif
 #include "web_pages.h"
 #include <WebServer.h>
 #include <Update.h>
@@ -37,21 +44,42 @@ WebServer server(80);
 
 // Runtime mode override flags (defined in main.cpp)
 extern bool httpForceClock;
+extern bool httpForceViz;
+#if VIZ_DEBUG_FB
+extern float measuredFps;
+#endif
 #if TOUCH_BUTTON_ENABLED
 extern bool manualClockMode;
 #endif
+
+// Any web page the user has open can make the browser send a form POST or a
+// multipart upload here without a CORS preflight. A custom header or a JSON
+// content type needs a preflight, which this server never answers, so only the
+// device's own page (or a non-browser client) can get these requests through.
+static bool fromOwnPage() {
+ return server.header("X-SmallOLED") == "1";
+}
+
+static bool rejectForeign(bool jsonBodyOk = false) {
+ if (fromOwnPage()) return false;
+ if (jsonBodyOk && server.header("Content-Type").startsWith("application/json")) return false;
+ server.send(403, "text/plain", "Forbidden: send the X-SmallOLED: 1 header");
+ return true;
+}
+
+static bool otaAllowed = false;
 
 // ========== Web Server Setup ==========
 void setupWebServer() {
  server.on("/", handleRoot);
  server.on("/portal.css", HTTP_GET, handlePortalCss);
  server.on("/portal.js", HTTP_GET, handlePortalJs);
- server.on("/save", HTTP_POST, handleSave);
- server.on("/reset", handleReset);
+ server.on("/save", HTTP_POST, []() { if (!rejectForeign()) handleSave(); });
+ server.on("/reset", HTTP_POST, []() { if (!rejectForeign()) handleReset(); });
  server.on("/metrics", handleMetricsAPI);
  server.on("/api/info", HTTP_GET, handleDeviceInfo);
  server.on("/api/export", HTTP_GET, handleExportConfig);
- server.on("/api/import", HTTP_POST, handleImportConfig);
+ server.on("/api/import", HTTP_POST, []() { if (!rejectForeign(true)) handleImportConfig(); });
  server.on("/api/rename", HTTP_POST, handleRename);
  server.on("/api/ntptest", HTTP_GET, handleNtpTest);
 
@@ -60,13 +88,35 @@ void setupWebServer() {
  server.on("/api/display/on", HTTP_GET, handleDisplayOn);
  server.on("/api/display/off", HTTP_GET, handleDisplayOff);
  server.on("/api/display/brightness", HTTP_GET, handleSetBrightness);
+#if LED_PWM_ENABLED
+ server.on("/api/led/on", HTTP_GET, handleLedOn);
+ server.on("/api/led/off", HTTP_GET, handleLedOff);
+ server.on("/api/led/brightness", HTTP_GET, handleLedBrightness);
+#endif
  server.on("/api/mode/clock", HTTP_GET, handleModeClock);
  server.on("/api/mode/auto", HTTP_GET, handleModeAuto);
+ server.on("/api/mode/viz", HTTP_GET, handleModeViz);
+ server.on("/api/viz/style", HTTP_GET, handleSetVizStyle);
+#if VIZ_DEBUG_FB
+ server.on("/api/debug/fb", HTTP_GET, handleDebugFramebuffer);
+#endif
  server.on("/api/clock/style", HTTP_GET, handleSetClockStyle);
+ server.on("/api/dragonball/demo", HTTP_GET, handleDragonBallDemo);
+#if GAMEPAD_ENABLED
+ server.on("/api/game/start", HTTP_GET, handleGameStart);
+ server.on("/api/game/stop", HTTP_GET, handleGameStop);
+ server.on("/api/game/status", HTTP_GET, handleGameStatus);
+ server.on("/api/game/forget", HTTP_GET, handleGameForget);
+ server.on("/api/game/hiscore/reset", HTTP_GET, handleGameResetHi);
+#endif
  server.on("/api/reboot", HTTP_GET, handleReboot);
 
  // OTA Firmware Update handlers
  server.on("/update", HTTP_POST, []() {
+ if (!otaAllowed) {
+   server.send(403, "text/plain", "Forbidden: send the X-SmallOLED: 1 header");
+   return;
+ }
  if (Update.hasError()) {
    // Surface the real reason (non-200 so the UI knows it failed). The common
    // case once the firmware outgrows an older default partition table is a
@@ -83,13 +133,21 @@ void setupWebServer() {
  ESP.restart();
  }, []() {
  HTTPUpload& upload = server.upload();
+ if (upload.status == UPLOAD_FILE_START) otaAllowed = fromOwnPage();
+ if (!otaAllowed) return;
  if (upload.status == UPLOAD_FILE_START) {
  Serial.printf("Update: %s\n", upload.filename.c_str());
+#if GAMEPAD_ENABLED
+ // A BLE connect in flight can stall the upload long enough to trip the task WDT.
+ gameModeStop();
+#endif
  if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // Start with max available size
  Update.printError(Serial);
  }
  } else if (upload.status == UPLOAD_FILE_WRITE) {
- // Write uploaded data
+ // The whole upload runs inside one handleClient() call: ~10 s on a good
+ // link, past the 15 s task WDT when BLE shares the radio.
+ esp_task_wdt_reset();
  if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
  Update.printError(Serial);
  }
@@ -102,6 +160,8 @@ void setupWebServer() {
  }
  });
 
+ const char* headerKeys[] = {"X-SmallOLED", "Content-Type"};
+ server.collectHeaders(headerKeys, 2);
  server.begin();
 }
 
@@ -132,7 +192,7 @@ void handleMetricsAPI() {
  doc["online"] = metricData.online;
  struct tm ti;
  char ts[6] = "--:--";
- if (getLocalTime(&ti, 0)) strftime(ts, sizeof(ts), "%H:%M", &ti);
+ if (peekLocalTime(&ti)) strftime(ts, sizeof(ts), "%H:%M", &ti);
  doc["time"] = ts;
 
  String json;
@@ -149,7 +209,7 @@ void handleDeviceInfo() {
  doc["ip"] = WiFi.localIP().toString();
  doc["hostname"] = String(settings.deviceName) + ".local";
  doc["deviceName"] = settings.deviceName;
- doc["displayType"] = settings.displayType;
+ doc["displayType"] = DISPLAY_TYPE;  // compile-time panel, not a stored setting
  doc["rssi"] = WiFi.RSSI();
  doc["uptime"] = millis() / 1000;
  doc["freeHeap"] = ESP.getFreeHeap();
@@ -171,25 +231,31 @@ void handleStatus() {
  JsonDocument doc;
 
  bool pcOnline = metricData.online;
-#if TOUCH_BUTTON_ENABLED
- bool showStats = pcOnline && !manualClockMode && !httpForceClock;
-#else
- bool showStats = pcOnline && !httpForceClock;
-#endif
+ DisplayMode mode = currentDisplayMode();
 
  // Report what the panel is actually doing, not what the configured brightness
  // says: scheduled dimming can have driven it to 0 while displayBrightness is
  // still the daytime value.
  doc["displayOn"] = !isDisplayForcedOff() && getLastAppliedBrightness() > 0;
  doc["forcedOff"] = isDisplayForcedOff();
- doc["mode"] = showStats ? "metrics" : "clock";
+ doc["mode"] = mode == MODE_GAME ? "game" : mode == MODE_VIZ ? "viz" : (mode == MODE_METRICS ? "metrics" : "clock");
  doc["forcedClock"] = httpForceClock;
+ doc["forcedViz"] = httpForceViz;
+ // The companion derives a boot timestamp from this to notice a reboot and
+ // re-force the visualizer (audio_spectrum.py _check_device_restart).
+ doc["uptime"] = millis() / 1000;
  doc["brightness"] = (settings.displayBrightness * 100) / 255; // percent
  doc["clockStyle"] = settings.clockStyle;
  doc["pcOnline"] = pcOnline;
  // Wake-ups the dim schedule refused to act on because a second check
  // disagreed. Non-zero means the device is being handed a wrong time (#59).
  doc["dimWakesIgnored"] = getSuppressedScheduleWakeCount();
+ WeatherData weather = getWeather();
+ doc["weatherValid"] = weather.valid;
+ if (weather.valid) doc["weatherAgeSeconds"] = (millis() - weather.fetchedAt) / 1000;
+#if VIZ_DEBUG_FB
+ doc["fps"] = measuredFps;
+#endif
 
  String json;
  serializeJson(doc, json);
@@ -226,36 +292,239 @@ void handleSetBrightness() {
              "{\"success\":true,\"brightness\":" + String(value) + "}");
 }
 
+#if LED_PWM_ENABLED
+// GET /api/led/on - turn the filament night light on at its stored brightness
+void handleLedOn() {
+ enableLED(true);
+ saveLedState();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json",
+             "{\"success\":true,\"ledOn\":true,\"brightness\":" +
+             String((settings.ledBrightness * 100) / 255) + "}");
+}
+
+// GET /api/led/off - turn the filament night light off
+void handleLedOff() {
+ enableLED(false);
+ saveLedState();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", "{\"success\":true,\"ledOn\":false}");
+}
+
+// GET /api/led/brightness?value=0-100 - set night light brightness; 0 turns it off
+// Optional raw=1 takes the value as an 8-bit PWM duty (0-255) instead of a
+// percentage, and save=0 applies it without touching flash. The config page
+// uses both so dragging the slider dims the LED live without wearing out NVS;
+// the form's Save button is what persists it.
+void handleLedBrightness() {
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ if (!server.hasArg("value")) {
+   server.send(400, "application/json", "{\"error\":\"Missing value (0-100)\"}");
+   return;
+ }
+ bool raw = server.hasArg("raw") && server.arg("raw") != "0";
+ int maxValue = raw ? 255 : 100;
+ int value = server.arg("value").toInt();
+ if (value < 0) value = 0;
+ if (value > maxValue) value = maxValue;
+ settings.ledBrightness = raw ? (uint8_t)value : (uint8_t)((value * 255) / 100);
+ settings.ledEnabled = settings.ledBrightness > 0;
+ setLEDBrightness(settings.ledBrightness);
+ if (!server.hasArg("save") || server.arg("save") != "0") saveLedState();
+ server.send(200, "application/json",
+             "{\"success\":true,\"ledOn\":" +
+             String(settings.ledEnabled ? "true" : "false") +
+             ",\"brightness\":" + String((settings.ledBrightness * 100) / 255) + "}");
+}
+#endif
+
+#if VIZ_DEBUG_FB
+// GET /api/debug/fb - dump the 1-bit framebuffer as a PBM (P4) image.
+// Development aid for checking what the panel actually renders; compiled out
+// unless -DVIZ_DEBUG_FB=1 is passed. Never enable in a release build.
+void handleDebugFramebuffer() {
+ uint8_t *fb = display.getBuffer();
+ if (!fb) {
+   server.send(500, "text/plain", "no framebuffer");
+   return;
+ }
+ // The panel buffer is page-major (8 rows per byte, LSB = topmost row of the
+ // page); PBM wants row-major MSB-first, so transpose rather than dump raw.
+ static uint8_t rows[SCREEN_HEIGHT * (SCREEN_WIDTH / 8)];
+ memset(rows, 0, sizeof(rows));
+ for (int y = 0; y < SCREEN_HEIGHT; y++) {
+   for (int x = 0; x < SCREEN_WIDTH; x++) {
+     if (fb[x + (y / 8) * SCREEN_WIDTH] & (1 << (y & 7))) {
+       rows[y * (SCREEN_WIDTH / 8) + (x >> 3)] |= 0x80 >> (x & 7);
+     }
+   }
+ }
+ char header[32];
+ int hlen = snprintf(header, sizeof(header), "P4%c%d %d%c", '\n', SCREEN_WIDTH,
+                     SCREEN_HEIGHT, '\n');
+ server.setContentLength(hlen + sizeof(rows));
+ server.send(200, "image/x-portable-bitmap", "");
+ server.sendContent(header, hlen);
+ server.sendContent((const char *)rows, sizeof(rows));
+}
+#endif
+
 // GET /api/mode/clock - force clock display even when the PC is online
 void handleModeClock() {
+#if GAMEPAD_ENABLED
+ gameModeStop();
+#endif
  httpForceClock = true;
+ httpForceViz = false;  // the two overrides are mutually exclusive
  server.sendHeader("Access-Control-Allow-Origin", "*");
  server.send(200, "application/json", "{\"success\":true,\"mode\":\"clock\"}");
 }
 
+// GET /api/mode/viz - force the audio visualizer. Needs the companion's audio
+// stream; without it the panel says so and drops back after the grace window.
+void handleModeViz() {
+#if GAMEPAD_ENABLED
+ gameModeStop();
+#endif
+ httpForceViz = true;
+ httpForceClock = false;
+ vizNoteForced();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", "{\"success\":true,\"mode\":\"viz\"}");
+}
+
+#if GAMEPAD_ENABLED
+// GET /api/game/start - enter game mode: scan for a BLE gamepad, then Falling Blocks.
+void handleGameStart() {
+ gameModeStart();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", "{\"success\":true,\"mode\":\"game\"}");
+}
+
+// GET /api/game/stop - leave game mode and release the pad.
+void handleGameStop() {
+ gameModeStop();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", "{\"success\":true}");
+}
+
+// GET /api/game/status - game mode and pad link, for the web UI.
+void handleGameStatus() {
+ static const char *LINKS[] = {"off", "searching", "connecting", "connected"};
+ JsonDocument doc;
+ doc["active"] = gameModeActive();
+ doc["link"] = LINKS[gamepadLink()];
+ doc["battery"] = gamepadBattery();
+ doc["paired"] = gamepadHasBond();
+ JsonArray games = doc["games"].to<JsonArray>();
+ for (uint8_t i = 0; i < gameCount(); i++) {
+   JsonObject g = games.add<JsonObject>();
+   g["name"] = gameName(i);
+   g["hi"] = gameLoadHi(gameHiKey(i));
+ }
+ String out;
+ serializeJson(doc, out);
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", out);
+}
+
+// GET /api/game/forget - drop every paired pad (a connected one is disconnected).
+void handleGameForget() {
+ gamepadForget();
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ server.send(200, "application/json", "{\"success\":true}");
+}
+
+// GET /api/game/hiscore/reset?id=N - clear one game's best score (index from
+// /api/game/status games[]); without id every game's.
+void handleGameResetHi() {
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ int id = -1;
+ if (server.hasArg("id")) {
+   id = server.arg("id").toInt();
+   if (id < 0 || id >= gameCount()) {
+     server.send(400, "application/json", "{\"error\":\"Unknown game id\"}");
+     return;
+   }
+ }
+ gameResetHi(id);
+ server.send(200, "application/json", "{\"success\":true}");
+}
+#endif
+
+// GET /api/viz/style?id=0-2 - switch the visualizer style at runtime.
+// Like /api/clock/style this mutates settings without persisting; a later
+// settings save from the web UI is what writes it to flash.
+void handleSetVizStyle() {
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ if (!server.hasArg("id")) {
+   server.send(400, "application/json", "{\"error\":\"Missing id (0-2)\"}");
+   return;
+ }
+ int id = server.arg("id").toInt();
+ if (id < 0 || id > 2) {
+   server.send(400, "application/json", "{\"error\":\"id must be 0-2\"}");
+   return;
+ }
+ settings.vizStyle = (uint8_t)id;
+ server.send(200, "application/json",
+             "{\"success\":true,\"vizStyle\":" + String(id) + "}");
+}
+
 // GET /api/mode/auto - resume automatic mode (metrics when PC online, clock otherwise)
 void handleModeAuto() {
+#if GAMEPAD_ENABLED
+ gameModeStop();
+#endif
  httpForceClock = false;
+ httpForceViz = false;
  server.sendHeader("Access-Control-Allow-Origin", "*");
  server.send(200, "application/json", "{\"success\":true,\"mode\":\"auto\"}");
 }
 
-// GET /api/clock/style?id=0-11 - switch the active clock animation
+// GET /api/clock/style?id=<style> - switch the active clock animation.
+// Ids are a sparse set (see CLOCK_STYLES in main.cpp), not a range.
 void handleSetClockStyle() {
  server.sendHeader("Access-Control-Allow-Origin", "*");
  if (!server.hasArg("id")) {
-   server.send(400, "application/json", "{\"error\":\"Missing id (0-11)\"}");
+   server.send(400, "application/json", "{\"error\":\"Missing id\"}");
    return;
  }
  int id = server.arg("id").toInt();
- if (id < 0 || id > 11) {
-   server.send(400, "application/json", "{\"error\":\"id must be 0-11\"}");
+ if (id < 0 || id > 255 || !isValidClockStyle((uint8_t)id)) {
+   server.send(400, "application/json", "{\"error\":\"unknown clock style id\"}");
    return;
  }
  settings.clockStyle = (uint8_t)id;
  resetClockAnimationState();
  server.send(200, "application/json",
              "{\"success\":true,\"clockStyle\":" + String(id) + "}");
+}
+
+// GET /api/dragonball/demo[?act=N|?stop=1] - unlisted showcase for the Dragon
+// Ball clock. Switches to it (not saved) and the clock screen, then plays every
+// act in turn - idle tricks, fights, Genki Dama, Shenron, the Kamehameha shot
+// and the Super Saiyan change, the last two replayed on the digits showing.
+// act=N plays just one; stop=1 ends the run. When the run ends the previous
+// style and display mode come back.
+void handleDragonBallDemo() {
+ server.sendHeader("Access-Control-Allow-Origin", "*");
+ int only = -1;
+ if (server.hasArg("act")) only = server.arg("act").toInt();
+ if (server.hasArg("stop")) only = -2;
+ int prevStyle = settings.clockStyle;
+ bool prevForce = httpForceClock;
+ if (only != -2) {
+   if (settings.clockStyle != 19) {
+     settings.clockStyle = 19;
+     resetClockAnimationState();
+   }
+   httpForceClock = true;
+   httpForceViz = false;
+ }
+ dragonBallStartDemo(only, prevStyle, prevForce);
+ server.send(200, "application/json",
+             "{\"success\":true,\"acts\":" + String(dragonBallDemoActs()) + "}");
 }
 
 // GET /api/reboot - soft restart (non-destructive, unlike /reset which wipes config)
@@ -324,8 +593,9 @@ static bool resolvePlaceholder(const char* n, String& out) {
     out = s; return true;
   }
   if (!strcmp(n, "HEAP")) { out = String(ESP.getFreeHeap() / 1024.0, 1); return true; }
+  if (!strcmp(n, "CHIPMODEL")) { out = ESP.getChipModel(); return true; }
   if (!strcmp(n, "DISPLAYMODEL")) {
-    out = (settings.displayType == 2) ? "CH1116" : (settings.displayType == 1) ? "SH1106" : "SSD1306";
+    out = (DISPLAY_TYPE == 2) ? "CH1116" : (DISPLAY_TYPE == 1) ? "SH1106" : "SSD1306";
     return true;
   }
   // Hides the OTA partition-limit warning on already-repartitioned devices.
@@ -363,7 +633,20 @@ static bool resolvePlaceholder(const char* n, String& out) {
     size_t tzCount;
     const TimezoneRegion* regions = getSupportedTimezones(&tzCount);
     out += "<option value=\"\">-- Select Region --</option>\n";
-    for (size_t i = 0; i < tzCount; i++) {
+    // Listed by UTC offset (stable), so zones appended to the database for
+    // index stability still sit next to their neighbours.
+    uint8_t order[256];
+    if (tzCount > sizeof(order)) tzCount = sizeof(order);
+    for (size_t k = 0; k < tzCount; k++) {
+      size_t j = k;
+      while (j > 0 && regions[order[j - 1]].gmtOffsetMinutes > regions[k].gmtOffsetMinutes) {
+        order[j] = order[j - 1];
+        j--;
+      }
+      order[j] = (uint8_t)k;
+    }
+    for (size_t k = 0; k < tzCount; k++) {
+      size_t i = order[k];
       bool isSelected = (settings.timezoneIndex < 255) ? (i == settings.timezoneIndex)
                                                        : (strcmp(settings.timezoneString, regions[i].posixString) == 0);
       // Prefix each option with its UTC offset so users can find their zone by
@@ -386,7 +669,27 @@ static bool resolvePlaceholder(const char* n, String& out) {
     return true; // resolved to "" when LED is disabled, so the slider is omitted
   }
 
+  // --- Touch button pin selector (only when the touch button is compiled in) ---
+  if (!strcmp(n, "TOUCH_PIN_CARD")) {
+#if TOUCH_BUTTON_ENABLED
+    String opts;
+    for (int pin = 0; pin <= TOUCH_PIN_MAX; pin++) {
+      if (!isValidTouchPin(pin)) continue;
+      const char* note = touchPinNote(pin);
+      opts += "<option value=\"" + String(pin) + "\"" +
+              (settings.touchButtonPin == pin ? " selected" : "") + ">GPIO " + String(pin);
+      if (pin == TOUCH_BUTTON_PIN) opts += " (default)";
+      if (*note) opts += " - " + String(note);
+      opts += "</option>";
+    }
+    out = R"TP(<div class="card"><h2 class="card-title">Touch button</h2><div class="field" style="margin-bottom:0"><label class="field-label" for="touchButtonPin">TTP223 signal pin</label><div class="select-wrap"><select name="touchButtonPin" id="touchButtonPin">)TP" + opts +
+          R"TP(</select></div><p class="field-hint">GPIO the touch sensor's SIG line is wired to. Pins used by the flash, the display bus, the USB port and the LED output are not listed. A pin marked <strong>strapping</strong> is read at power-up, so a sensor idling the wrong way can stop the board booting; <strong>UART0</strong> pins cost the serial console. Takes effect on save, no restart needed.</p></div></div>)TP";
+#endif
+    return true; // resolves to "" without a touch button, hiding the card
+  }
+
   // --- Per-setting placeholders (auto-generated, see gen_template.py) ---
+  if (!strcmp(n, "V_CYCLECONFIG")) { out = settings.cycleConfig; return true; }
   if (!strcmp(n, "SEL_CLOCKSTYLE_0")) { out = String(settings.clockStyle == 0 ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_CLOCKSTYLE_1")) { out = String(settings.clockStyle == 1 ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_CLOCKSTYLE_2")) { out = String(settings.clockStyle == 2 ? "selected" : ""); return true; }
@@ -398,7 +701,11 @@ static bool resolvePlaceholder(const char* n, String& out) {
   if (!strcmp(n, "SEL_CLOCKSTYLE_9")) { out = String(settings.clockStyle == 9 ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_CLOCKSTYLE_10")) { out = String(settings.clockStyle == 10 ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_CLOCKSTYLE_11")) { out = String(settings.clockStyle == 11 ? "selected" : ""); return true; }
-  if (!strcmp(n, "SEL_CLOCKSTYLE_12")) { out = String(settings.clockStyle == 12 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_CLOCKSTYLE_16")) { out = String(settings.clockStyle == 16 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_CLOCKSTYLE_14")) { out = String(settings.clockStyle == 14 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_CLOCKSTYLE_18")) { out = String(settings.clockStyle == 18 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_CLOCKSTYLE_19")) { out = String(settings.clockStyle == 19 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_CLOCKSTYLE_20")) { out = String(settings.clockStyle == 20 ? "selected" : ""); return true; }
   if (!strcmp(n, "DSP_CLOCKSTYLE_0")) { out = String(settings.clockStyle == 0 ? "block" : "none"); return true; }
   if (!strcmp(n, "V_MARIOBOUNCEHEIGHT")) { out = String(settings.marioBounceHeight); return true; }
   if (!strcmp(n, "F_MARIOBOUNCEHEIGHT")) { out = String(settings.marioBounceHeight / 10.0, 1); return true; }
@@ -477,6 +784,34 @@ static bool resolvePlaceholder(const char* n, String& out) {
   if (!strcmp(n, "CHK_ASTEROIDSSHOWDATE")) { out = String(settings.asteroidsShowDate ? "checked" : ""); return true; }
   if (!strcmp(n, "CHK_ASTEROIDSTRANSPARENT")) { out = String(settings.asteroidsTransparent ? "checked" : ""); return true; }
   if (!strcmp(n, "DSP_CLOCKSTYLE_11")) { out = String(settings.clockStyle == 11 ? "block" : "none"); return true; }
+  if (!strcmp(n, "DSP_CLOCKSTYLE_16")) { out = String(settings.clockStyle == 16 ? "block" : "none"); return true; }
+  if (!strcmp(n, "DSP_CLOCKSTYLE_18")) { out = String(settings.clockStyle == 18 ? "block" : "none"); return true; }
+  if (!strcmp(n, "DSP_CLOCKSTYLE_19")) { out = String(settings.clockStyle == 19 ? "block" : "none"); return true; }
+  if (!strcmp(n, "DSP_CLOCKSTYLE_14")) { out = String(settings.clockStyle == 14 ? "block" : "none"); return true; }
+  if (!strcmp(n, "V_WEATHERLAT")) { out = weatherConfigured() ? String(settings.weatherLat, 4) : String(""); return true; }
+  if (!strcmp(n, "V_WEATHERLON")) { out = weatherConfigured() ? String(settings.weatherLon, 4) : String(""); return true; }
+  if (!strcmp(n, "CHK_WEATHERF")) { out = String(settings.weatherUseFahrenheit ? "checked" : ""); return true; }
+  if (!strncmp(n, "SEL_WEATHERLAY_", 15)) { out = String(settings.weatherLayout == atoi(n + 15) ? "selected" : ""); return true; }
+  if (!strcmp(n, "CHK_DRAGONIDLETRICKS")) { out = String(settings.dragonIdleTricks ? "checked" : ""); return true; }
+  if (!strcmp(n, "SEL_TRONBIKESTYLE_0")) { out = String(settings.tronBikeStyle == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_TRONBIKESTYLE_1")) { out = String(settings.tronBikeStyle == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "CHK_TRONSHOWGRID")) { out = String(settings.tronShowGrid ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_TRONSHOWBORDER")) { out = String(settings.tronShowBorder ? "checked" : ""); return true; }
+  if (!strcmp(n, "V_VIZREFRESHHZ")) { out = String(settings.vizRefreshHz); return true; }
+  if (!strcmp(n, "SEL_VIZSTYLE_0")) { out = String(settings.vizStyle == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_VIZSTYLE_1")) { out = String(settings.vizStyle == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_VIZSTYLE_2")) { out = String(settings.vizStyle == 2 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_VIZBARSTYLE_0")) { out = String(settings.vizBarStyle == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_VIZBARSTYLE_1")) { out = String(settings.vizBarStyle == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_VIZBARSTYLE_2")) { out = String(settings.vizBarStyle == 2 ? "selected" : ""); return true; }
+  if (!strcmp(n, "CHK_VIZPEAKDOTS")) { out = String(settings.vizPeakDots ? "checked" : ""); return true; }
+  if (!strcmp(n, "V_VIZSILENCETIMEOUT")) { out = String(settings.vizSilenceTimeout); return true; }
+  if (!strcmp(n, "CHK_VIZSHOWCLOCK")) { out = String(settings.vizShowClock ? "checked" : ""); return true; }
+  if (!strcmp(n, "V_SCOPEGAIN")) { out = String(settings.scopeGain); return true; }
+  if (!strcmp(n, "SEL_SCOPETRAIL_0")) { out = String(settings.scopeTrail == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_SCOPETRAIL_1")) { out = String(settings.scopeTrail == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "CHK_SCOPEGRID")) { out = String(settings.scopeGrid ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_SCOPEFILL")) { out = String(settings.scopeFill ? "checked" : ""); return true; }
   if (!strcmp(n, "V_DINOSPEED")) { out = String(settings.dinoSpeed); return true; }
   if (!strcmp(n, "F_DINOSPEED")) { out = String(settings.dinoSpeed / 10.0, 1); return true; }
   if (!strcmp(n, "SEL_DINOCACTUSFREQ_0")) { out = String(settings.dinoCactusFreq == 0 ? "selected" : ""); return true; }
@@ -484,6 +819,23 @@ static bool resolvePlaceholder(const char* n, String& out) {
   if (!strcmp(n, "SEL_DINOCACTUSFREQ_2")) { out = String(settings.dinoCactusFreq == 2 ? "selected" : ""); return true; }
   if (!strcmp(n, "CHK_DINOSHOWCLOUDS")) { out = String(settings.dinoShowClouds ? "checked" : ""); return true; }
   if (!strcmp(n, "CHK_DINOSHOWDATE")) { out = String(settings.dinoShowDate ? "checked" : ""); return true; }
+  if (!strcmp(n, "GAME_HIDDEN")) { out = GAMEPAD_ENABLED ? "" : "hidden"; return true; }
+  if (!strcmp(n, "CHK_GAMERUMBLE")) { out = String(settings.gameRumble ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_BLOCKSGHOST")) { out = String(settings.blocksGhost ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_BLOCKSSTICKDROP")) { out = String(settings.blocksStickDrop ? "checked" : ""); return true; }
+  if (!strcmp(n, "V_BLOCKSSTARTLEVEL")) { out = String(settings.blocksStartLevel); return true; }
+  if (!strncmp(n, "SEL_GAMEIDLE_", 13)) { out = String(settings.gameIdleExitMin == atoi(n + 13) ? "selected" : ""); return true; }
+  if (!strcmp(n, "V_LIFESPEED")) { out = String(settings.lifeSpeed); return true; }
+  if (!strcmp(n, "SEL_LIFEDENSITY_0")) { out = String(settings.lifeDensity == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_LIFEDENSITY_1")) { out = String(settings.lifeDensity == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_LIFEDENSITY_2")) { out = String(settings.lifeDensity == 2 ? "selected" : ""); return true; }
+  if (!strcmp(n, "CHK_LIFESHOWDATE")) { out = String(settings.lifeShowDate ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_LIFESMALLCLOCK")) { out = String(settings.lifeSmallClock ? "checked" : ""); return true; }
+  if (!strcmp(n, "CHK_LIFESMALLCELLS")) { out = String(settings.lifeSmallCells ? "checked" : ""); return true; }
+  if (!strcmp(n, "SEL_LIFECLOCKPOS_0")) { out = String(settings.lifeClockPos == 0 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_LIFECLOCKPOS_1")) { out = String(settings.lifeClockPos == 1 ? "selected" : ""); return true; }
+  if (!strcmp(n, "SEL_LIFECLOCKPOS_2")) { out = String(settings.lifeClockPos == 2 ? "selected" : ""); return true; }
+  if (!strcmp(n, "DSP_LIFESMALLCLOCK")) { out = String(settings.lifeSmallClock ? "block" : "none"); return true; }
   if (!strcmp(n, "SEL_USE24HOUR")) { out = String(settings.use24Hour ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_USE24HOUR_NOT")) { out = String(!settings.use24Hour ? "selected" : ""); return true; }
   if (!strcmp(n, "SEL_DATEFORMAT_0")) { out = String(settings.dateFormat == 0 ? "selected" : ""); return true; }
@@ -515,6 +867,7 @@ static bool resolvePlaceholder(const char* n, String& out) {
   if (!strcmp(n, "V_SUBNET")) { out = String(settings.subnet); return true; }
   if (!strcmp(n, "V_DNS1")) { out = String(settings.dns1); return true; }
   if (!strcmp(n, "V_DNS2")) { out = String(settings.dns2); return true; }
+  if (!strcmp(n, "V_UDPPORT")) { out = String(settings.udpPort); return true; }
   if (!strcmp(n, "V_NTPSERVER1")) { out = String(settings.ntpServer1); return true; }
   if (!strcmp(n, "V_NTPSERVER2")) { out = String(settings.ntpServer2); return true; }
   if (!strcmp(n, "CHK_SHOWIPATBOOT")) { out = String(settings.showIPAtBoot ? "checked" : ""); return true; }
@@ -704,7 +1057,91 @@ void handlePortalJs() {
   streamStatic(PORTAL_JS, sizeof(PORTAL_JS) - 1, "application/javascript");
 }
 
+// Clamp every bounded setting into range. assertBounds() in utils only
+// logs, which is enough for the web form (its inputs carry min/max) but
+// not for an imported JSON file, which can carry anything. Shared by
+// handleSave and handleImportConfig so the two cannot drift.
+static void clampSetting(uint8_t& v, int lo, int hi, const char* name) {
+  if (v < lo || v > hi) {
+    Serial.printf("Import/save: %s out of range (%d), clamping to [%d,%d]%c",
+                  name, v, lo, hi, '\n');
+    v = v < lo ? lo : hi;
+  }
+}
+static void clampSetting(int16_t& v, int lo, int hi, const char* name) {
+  if (v < lo || v > hi) {
+    Serial.printf("Import/save: %s out of range (%d), clamping to [%d,%d]%c",
+                  name, v, lo, hi, '\n');
+    v = v < lo ? lo : hi;
+  }
+}
+
+void validateSettings() {
+ if (!isValidClockStyle(settings.clockStyle)) {
+ Serial.print("WARNING: unknown clockStyle, falling back to 0: ");
+ Serial.println(settings.clockStyle);
+ settings.clockStyle = 0;
+ }
+ clampSetting(settings.gmtOffset, -720, 840, "gmtOffset"); // -12h to +14h in minutes
+ clampSetting(settings.clockPosition, 0, 2, "clockPosition");
+ clampSetting(settings.displayRowMode, 0, 3, "displayRowMode");
+ clampSetting(settings.colonBlinkMode, 0, 2, "colonBlinkMode");
+ clampSetting(settings.colonBlinkRate, 5, 50, "colonBlinkRate");
+ clampSetting(settings.refreshRateMode, 0, 1, "refreshRateMode");
+ clampSetting(settings.refreshRateHz, 1, 60, "refreshRateHz");
+ clampSetting(settings.marioBounceHeight, 10, 80, "marioBounceHeight");
+ clampSetting(settings.marioBounceSpeed, 2, 15, "marioBounceSpeed");
+ clampSetting(settings.marioWalkSpeed, 15, 35, "marioWalkSpeed");
+ clampSetting(settings.pongBallSpeed, 16, 30, "pongBallSpeed");
+ clampSetting(settings.pongBounceStrength, 1, 8, "pongBounceStrength");
+ clampSetting(settings.pongBounceDamping, 50, 95, "pongBounceDamping");
+ clampSetting(settings.pongPaddleWidth, 10, 40, "pongPaddleWidth");
+ clampSetting(settings.pacmanSpeed, 5, 30, "pacmanSpeed");
+ clampSetting(settings.pacmanEatingSpeed, 10, 50, "pacmanEatingSpeed");
+ clampSetting(settings.pacmanMouthSpeed, 5, 20, "pacmanMouthSpeed");
+ clampSetting(settings.pacmanPelletCount, 0, 20, "pacmanPelletCount");
+ clampSetting(settings.spaceCharacterType, 0, 1, "spaceCharacterType");
+ clampSetting(settings.spacePatrolSpeed, 2, 15, "spacePatrolSpeed");
+ clampSetting(settings.spaceAttackSpeed, 10, 40, "spaceAttackSpeed");
+ clampSetting(settings.spaceLaserSpeed, 20, 80, "spaceLaserSpeed");
+ clampSetting(settings.spaceExplosionGravity, 3, 10, "spaceExplosionGravity");
+ clampSetting(settings.snakeSpeed, 5, 30, "snakeSpeed");
+ clampSetting(settings.snakeLength, 4, 12, "snakeLength");
+ clampSetting(settings.tetrisFallSpeed, 5, 30, "tetrisFallSpeed");
+ clampSetting(settings.tetrisBlockStyle, 0, 1, "tetrisBlockStyle");
+ clampSetting(settings.tetrisAnimStyle, 0, 1, "tetrisAnimStyle");
+ clampSetting(settings.tetrisDatePosition, 0, 1, "tetrisDatePosition");
+ clampSetting(settings.tetrisDotSpeed, 5, 30, "tetrisDotSpeed");
+ clampSetting(settings.tetrisDotOrder, 0, 1, "tetrisDotOrder");
+ clampSetting(settings.asteroidsShipSpeed, 5, 25, "asteroidsShipSpeed");
+ clampSetting(settings.asteroidsRockCount, 1, 4, "asteroidsRockCount");
+ clampSetting(settings.asteroidsRockSpeed, 3, 20, "asteroidsRockSpeed");
+ clampSetting(settings.tronBikeStyle, 0, 1, "tronBikeStyle");
+ clampSetting(settings.vizStyle, 0, 2, "vizStyle");
+ clampSetting(settings.vizRefreshHz, 15, 60, "vizRefreshHz");
+ clampSetting(settings.vizBarStyle, 0, 2, "vizBarStyle");
+ clampSetting(settings.scopeTrail, 0, 1, "scopeTrail");
+ clampSetting(settings.scopeGain, 50, 200, "scopeGain");
+ clampSetting(settings.dinoSpeed, 5, 30, "dinoSpeed");
+ clampSetting(settings.dinoCactusFreq, 0, 2, "dinoCactusFreq");
+ clampSetting(settings.lifeSpeed, 2, 20, "lifeSpeed");
+ clampSetting(settings.gameIdleExitMin, 0, 60, "gameIdleExitMin");
+ clampSetting(settings.blocksStartLevel, 1, 10, "blocksStartLevel");
+ clampSetting(settings.lifeDensity, 0, 2, "lifeDensity");
+ clampSetting(settings.lifeClockPos, 0, 2, "lifeClockPos");
+ clampSetting(settings.weatherLayout, 0, 4, "weatherLayout");
+}
+
 void handleSave() {
+ if (server.hasArg("cycleConfig")) {
+ String cycle = server.arg("cycleConfig");
+ CycleEntry checkedCycle[CYCLE_COUNT];
+ if (cycle.length() >= sizeof(settings.cycleConfig) || !parseCycleConfig(cycle.c_str(), checkedCycle)) {
+ server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid rotation: enable a clock and use 5-3600 seconds\"}");
+ return;
+ }
+ strcpy(settings.cycleConfig, cycle.c_str());
+ }
  if (server.hasArg("clockStyle")) {
  settings.clockStyle = server.arg("clockStyle").toInt();
  }
@@ -795,10 +1232,21 @@ void handleSave() {
  }
  }
 
+#if TOUCH_BUTTON_ENABLED
+ // Save touch button pin (rejects anything the hardware cannot drive)
+ if (server.hasArg("touchButtonPin")) {
+ int newTouchPin = server.arg("touchButtonPin").toInt();
+ if (isValidTouchPin(newTouchPin) && newTouchPin != settings.touchButtonPin) {
+ applyTouchButtonPin((uint8_t)newTouchPin); // rebinds the input immediately
+ }
+ }
+#endif
+
 #if LED_PWM_ENABLED
  // Save LED brightness
  if (server.hasArg("ledBrightness")) {
  settings.ledBrightness = server.arg("ledBrightness").toInt();
+ settings.ledEnabled = settings.ledBrightness > 0; // slider drives on/off
  setLEDBrightness(settings.ledBrightness); // Apply immediately
  }
 #endif
@@ -955,6 +1403,36 @@ void handleSave() {
  settings.asteroidsTransparent = server.hasArg("asteroidsTransparent");
 
  // Save Dino Runner settings
+ if (server.hasArg("tronBikeStyle")) {
+ settings.tronBikeStyle = server.arg("tronBikeStyle").toInt();
+ }
+ settings.tronShowGrid = server.hasArg("tronShowGrid");
+ settings.tronShowBorder = server.hasArg("tronShowBorder");
+ if (server.hasArg("vizStyle")) {
+ settings.vizStyle = server.arg("vizStyle").toInt();
+ }
+ if (server.hasArg("vizRefreshHz")) {
+ settings.vizRefreshHz = server.arg("vizRefreshHz").toInt();
+ }
+ if (server.hasArg("vizBarStyle")) {
+ settings.vizBarStyle = server.arg("vizBarStyle").toInt();
+ }
+ if (server.hasArg("scopeGain")) {
+ settings.scopeGain = server.arg("scopeGain").toInt();
+ }
+ if (server.hasArg("scopeTrail")) {
+ settings.scopeTrail = server.arg("scopeTrail").toInt();
+ }
+ // Checkboxes only appear in the POST body when ticked, so their absence is
+ // the "off" signal - same pattern as every other checkbox on this form.
+ settings.vizPeakDots = server.hasArg("vizPeakDots");
+ if (server.hasArg("vizSilenceTimeout")) {
+   long q = server.arg("vizSilenceTimeout").toInt();
+   if (q >= 0 && q <= 255) settings.vizSilenceTimeout = (uint8_t)q;
+ }
+ settings.vizShowClock = server.hasArg("vizShowClock");
+ settings.scopeGrid = server.hasArg("scopeGrid");
+ settings.scopeFill = server.hasArg("scopeFill");
  if (server.hasArg("dinoSpeed")) {
  settings.dinoSpeed = server.arg("dinoSpeed").toInt();
  }
@@ -963,6 +1441,40 @@ void handleSave() {
  }
  settings.dinoShowClouds = server.hasArg("dinoShowClouds");
  settings.dinoShowDate = server.hasArg("dinoShowDate");
+ settings.gameRumble = server.hasArg("gameRumble");
+ settings.blocksStickDrop = server.hasArg("blocksStickDrop");
+ settings.blocksGhost = server.hasArg("blocksGhost");
+ if (server.hasArg("blocksStartLevel")) {
+ settings.blocksStartLevel = server.arg("blocksStartLevel").toInt();
+ }
+ if (server.hasArg("gameIdleExitMin")) {
+ settings.gameIdleExitMin = server.arg("gameIdleExitMin").toInt();
+ }
+ if (server.hasArg("lifeSpeed")) {
+ settings.lifeSpeed = server.arg("lifeSpeed").toInt();
+ }
+ if (server.hasArg("lifeDensity")) {
+ settings.lifeDensity = server.arg("lifeDensity").toInt();
+ }
+ settings.lifeShowDate = server.hasArg("lifeShowDate");
+ settings.lifeSmallClock = server.hasArg("lifeSmallClock");
+ settings.lifeSmallCells = server.hasArg("lifeSmallCells");
+ settings.dragonIdleTricks = server.hasArg("dragonIdleTricks");
+ if (server.hasArg("weatherLat") && server.hasArg("weatherLon")) {
+ // Empty fields clear the location (0,0 is the "unset" marker)
+ float lat = server.arg("weatherLat").toFloat();
+ float lon = server.arg("weatherLon").toFloat();
+ if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+ settings.weatherLat = lat;
+ settings.weatherLon = lon;
+ }
+ settings.weatherUseFahrenheit = server.hasArg("weatherFahrenheit");
+ if (server.hasArg("weatherLayout")) settings.weatherLayout = server.arg("weatherLayout").toInt();
+ weatherSettingsChanged();
+ }
+ if (server.hasArg("lifeClockPos")) {
+ settings.lifeClockPos = server.arg("lifeClockPos").toInt();
+ }
 
  // Save network configuration
  if (server.hasArg("deviceName")) {
@@ -985,6 +1497,15 @@ void handleSave() {
    }
  }
  settings.showIPAtBoot = server.hasArg("showIPAtBoot");
+ bool udpPortChanged = false;
+ if (server.hasArg("udpPort")) {
+   long p = server.arg("udpPort").toInt();
+   // 1024+ stays clear of the well-known range; 80 is this web server.
+   if (p >= 1024 && p <= 65535 && (uint16_t)p != settings.udpPort) {
+     settings.udpPort = (uint16_t)p;
+     udpPortChanged = true;
+   }
+ }
  bool previousStaticIPSetting = settings.useStaticIP;
  if (server.hasArg("useStaticIP")) {
  settings.useStaticIP = server.arg("useStaticIP").toInt() == 1;
@@ -1041,8 +1562,19 @@ void handleSave() {
  safeCopyString(settings.ntpServer2, s.c_str(), sizeof(settings.ntpServer2));
  }
 
+ // Metric rows are rendered in the browser from live /metrics data, so a page
+ // loaded before any PC packet arrived posts no metric fields at all. Every
+ // rendered row carries a metric_<id> marker: without it the row was never on
+ // the page and its stored layout must survive the save instead of being
+ // reset to defaults.
+ bool metricRowPosted[MAX_METRICS];
+ for (int i = 0; i < MAX_METRICS; i++) {
+ metricRowPosted[i] = server.hasArg("metric_" + String(i + 1));
+ }
+
  // Save custom labels
  for (int i = 0; i < MAX_METRICS; i++) {
+ if (!metricRowPosted[i]) continue;
  String labelArg = "label_" + String(i + 1);
  if (server.hasArg(labelArg)) {
  String label = server.arg(labelArg);
@@ -1058,6 +1590,7 @@ void handleSave() {
 
  // Save metric display order
  for (int i = 0; i < MAX_METRICS; i++) {
+ if (!metricRowPosted[i]) continue;
  String orderArg = "order_" + String(i + 1);
  if (server.hasArg(orderArg)) {
  settings.metricOrder[i] = server.arg(orderArg).toInt();
@@ -1066,6 +1599,7 @@ void handleSave() {
 
  // Save metric companions
  for (int i = 0; i < MAX_METRICS; i++) {
+ if (!metricRowPosted[i]) continue;
  String companionArg = "companion_" + String(i + 1);
  if (server.hasArg(companionArg)) {
  settings.metricCompanions[i] = server.arg(companionArg).toInt();
@@ -1076,6 +1610,7 @@ void handleSave() {
 
  // Save metric positions
  for (int i = 0; i < MAX_METRICS; i++) {
+ if (!metricRowPosted[i]) continue;
  String positionArg = "position_" + String(i + 1);
  if (server.hasArg(positionArg)) {
  settings.metricPositions[i] = server.arg(positionArg).toInt();
@@ -1086,6 +1621,7 @@ void handleSave() {
 
  // Save progress bar settings
  for (int i = 0; i < MAX_METRICS; i++) {
+ if (!metricRowPosted[i]) continue;
  String barPosArg = "barPosition_" + String(i + 1);
  String minArg = "barMin_" + String(i + 1);
  String maxArg = "barMax_" + String(i + 1);
@@ -1167,44 +1703,7 @@ void handleSave() {
  }
  }
 
- // Validate settings bounds before saving
- assertBounds(settings.clockStyle, 0, 12, "clockStyle");
- assertBounds(settings.gmtOffset, -720, 840, "gmtOffset"); // -12h to +14h in minutes
- assertBounds(settings.clockPosition, 0, 2, "clockPosition");
- assertBounds(settings.displayRowMode, 0, 3, "displayRowMode");
- assertBounds(settings.colonBlinkMode, 0, 2, "colonBlinkMode");
- assertBounds(settings.colonBlinkRate, 5, 50, "colonBlinkRate");
- assertBounds(settings.refreshRateMode, 0, 1, "refreshRateMode");
- assertBounds(settings.refreshRateHz, 1, 60, "refreshRateHz");
- assertBounds(settings.marioBounceHeight, 10, 80, "marioBounceHeight");
- assertBounds(settings.marioBounceSpeed, 2, 15, "marioBounceSpeed");
- assertBounds(settings.marioWalkSpeed, 15, 35, "marioWalkSpeed");
- assertBounds(settings.pongBallSpeed, 16, 30, "pongBallSpeed");
- assertBounds(settings.pongBounceStrength, 1, 8, "pongBounceStrength");
- assertBounds(settings.pongBounceDamping, 50, 95, "pongBounceDamping");
- assertBounds(settings.pongPaddleWidth, 10, 40, "pongPaddleWidth");
- assertBounds(settings.pacmanSpeed, 5, 30, "pacmanSpeed");
- assertBounds(settings.pacmanEatingSpeed, 10, 50, "pacmanEatingSpeed");
- assertBounds(settings.pacmanMouthSpeed, 5, 20, "pacmanMouthSpeed");
- assertBounds(settings.pacmanPelletCount, 0, 20, "pacmanPelletCount");
- assertBounds(settings.spaceCharacterType, 0, 1, "spaceCharacterType");
- assertBounds(settings.spacePatrolSpeed, 2, 15, "spacePatrolSpeed");
- assertBounds(settings.spaceAttackSpeed, 10, 40, "spaceAttackSpeed");
- assertBounds(settings.spaceLaserSpeed, 20, 80, "spaceLaserSpeed");
- assertBounds(settings.spaceExplosionGravity, 3, 10, "spaceExplosionGravity");
- assertBounds(settings.snakeSpeed, 5, 30, "snakeSpeed");
- assertBounds(settings.snakeLength, 4, 12, "snakeLength");
- assertBounds(settings.tetrisFallSpeed, 5, 30, "tetrisFallSpeed");
- assertBounds(settings.tetrisBlockStyle, 0, 1, "tetrisBlockStyle");
- assertBounds(settings.tetrisAnimStyle, 0, 1, "tetrisAnimStyle");
- assertBounds(settings.tetrisDatePosition, 0, 1, "tetrisDatePosition");
- assertBounds(settings.tetrisDotSpeed, 5, 30, "tetrisDotSpeed");
- assertBounds(settings.tetrisDotOrder, 0, 1, "tetrisDotOrder");
- assertBounds(settings.asteroidsShipSpeed, 5, 25, "asteroidsShipSpeed");
- assertBounds(settings.asteroidsRockCount, 1, 4, "asteroidsRockCount");
- assertBounds(settings.asteroidsRockSpeed, 3, 20, "asteroidsRockSpeed");
- assertBounds(settings.dinoSpeed, 5, 30, "dinoSpeed");
- assertBounds(settings.dinoCactusFreq, 0, 2, "dinoCactusFreq");
+ validateSettings();
 
  saveSettings();
  applyTimezone();
@@ -1214,6 +1713,9 @@ void handleSave() {
  // clock_globals.cpp; also clears time_overridden and Pac-Man eat-queue
  // residue).
  resetClockAnimationState();
+
+ // The stats socket rebinds in place; no restart needed for it.
+ if (udpPortChanged) beginStatsUdp();
 
  // Check if network settings changed - if so, restart is required
  bool networkChanged = (previousStaticIPSetting != settings.useStaticIP);
@@ -1256,6 +1758,7 @@ void handleExportConfig() {
 
  // Clock settings
  json += "\"clockStyle\":" + String(settings.clockStyle) + ",";
+ json += "\"cycleConfig\":\"" + String(settings.cycleConfig) + "\",";
  json += "\"timezoneString\":\"" + String(settings.timezoneString) + "\",";
  json += "\"gmtOffset\":" + String(settings.gmtOffset) + ",";
  json += "\"daylightSaving\":" + String(settings.daylightSaving ? "true" : "false") + ",";
@@ -1269,8 +1772,108 @@ void handleExportConfig() {
  json += "\"useNetworkMBFormat\":" + String(settings.useNetworkMBFormat ? "true" : "false") + ",";
  json += "\"deviceName\":\"" + String(settings.deviceName) + "\",";
  json += "\"showIPAtBoot\":" + String(settings.showIPAtBoot ? "true" : "false") + ",";
+ json += "\"udpPort\":" + String(settings.udpPort) + ",";
  json += "\"ntpServer1\":\"" + String(settings.ntpServer1) + "\",";
  json += "\"ntpServer2\":\"" + String(settings.ntpServer2) + "\",";
+
+ // Display, animation and visualizer settings. Without these an exported
+ // config restores the layout but not how anything actually looks.
+ json += "\"colonBlinkMode\":" + String(settings.colonBlinkMode) + ",";
+ json += "\"colonBlinkRate\":" + String(settings.colonBlinkRate) + ",";
+ json += "\"refreshRateMode\":" + String(settings.refreshRateMode) + ",";
+ json += "\"refreshRateHz\":" + String(settings.refreshRateHz) + ",";
+ json += "\"displayBrightness\":" + String(settings.displayBrightness) + ",";
+#if TOUCH_BUTTON_ENABLED
+ json += "\"touchButtonPin\":" + String(settings.touchButtonPin) + ",";
+#endif
+ json += "\"dimStartHour\":" + String(settings.dimStartHour) + ",";
+ json += "\"dimEndHour\":" + String(settings.dimEndHour) + ",";
+ json += "\"dimBrightness\":" + String(settings.dimBrightness) + ",";
+ json += "\"marioBounceHeight\":" + String(settings.marioBounceHeight) + ",";
+ json += "\"marioBounceSpeed\":" + String(settings.marioBounceSpeed) + ",";
+ json += "\"marioWalkSpeed\":" + String(settings.marioWalkSpeed) + ",";
+ json += "\"marioEncounterFreq\":" + String(settings.marioEncounterFreq) + ",";
+ json += "\"marioEncounterSpeed\":" + String(settings.marioEncounterSpeed) + ",";
+ json += "\"spaceCharacterType\":" + String(settings.spaceCharacterType) + ",";
+ json += "\"spacePatrolSpeed\":" + String(settings.spacePatrolSpeed) + ",";
+ json += "\"spaceAttackSpeed\":" + String(settings.spaceAttackSpeed) + ",";
+ json += "\"spaceLaserSpeed\":" + String(settings.spaceLaserSpeed) + ",";
+ json += "\"spaceExplosionGravity\":" + String(settings.spaceExplosionGravity) + ",";
+ json += "\"pongBallSpeed\":" + String(settings.pongBallSpeed) + ",";
+ json += "\"pongBounceStrength\":" + String(settings.pongBounceStrength) + ",";
+ json += "\"pongBounceDamping\":" + String(settings.pongBounceDamping) + ",";
+ json += "\"pongPaddleWidth\":" + String(settings.pongPaddleWidth) + ",";
+ json += "\"pacmanSpeed\":" + String(settings.pacmanSpeed) + ",";
+ json += "\"pacmanEatingSpeed\":" + String(settings.pacmanEatingSpeed) + ",";
+ json += "\"pacmanMouthSpeed\":" + String(settings.pacmanMouthSpeed) + ",";
+ json += "\"pacmanPelletCount\":" + String(settings.pacmanPelletCount) + ",";
+ json += "\"snakeSpeed\":" + String(settings.snakeSpeed) + ",";
+ json += "\"snakeLength\":" + String(settings.snakeLength) + ",";
+ json += "\"tetrisFallSpeed\":" + String(settings.tetrisFallSpeed) + ",";
+ json += "\"tetrisBlockStyle\":" + String(settings.tetrisBlockStyle) + ",";
+ json += "\"tetrisAnimStyle\":" + String(settings.tetrisAnimStyle) + ",";
+ json += "\"tetrisDatePosition\":" + String(settings.tetrisDatePosition) + ",";
+ json += "\"tetrisDotSpeed\":" + String(settings.tetrisDotSpeed) + ",";
+ json += "\"tetrisDotOrder\":" + String(settings.tetrisDotOrder) + ",";
+ json += "\"asteroidsShipSpeed\":" + String(settings.asteroidsShipSpeed) + ",";
+ json += "\"asteroidsRockCount\":" + String(settings.asteroidsRockCount) + ",";
+ json += "\"asteroidsRockSpeed\":" + String(settings.asteroidsRockSpeed) + ",";
+ json += "\"dinoSpeed\":" + String(settings.dinoSpeed) + ",";
+ json += "\"dinoCactusFreq\":" + String(settings.dinoCactusFreq) + ",";
+ json += "\"lifeSpeed\":" + String(settings.lifeSpeed) + ",";
+ json += "\"gameIdleExitMin\":" + String(settings.gameIdleExitMin) + ",";
+ json += "\"blocksStartLevel\":" + String(settings.blocksStartLevel) + ",";
+ json += "\"gameRumble\":" + String(settings.gameRumble ? "true" : "false") + ",";
+ json += "\"blocksStickDrop\":" + String(settings.blocksStickDrop ? "true" : "false") + ",";
+ json += "\"blocksGhost\":" + String(settings.blocksGhost ? "true" : "false") + ",";
+#if GAMEPAD_ENABLED
+ json += "\"gameHi\":{";
+ for (uint8_t i = 0; i < gameCount(); i++) {
+   if (i) json += ",";
+   json += "\"" + String(gameHiKey(i)) + "\":" + String(gameLoadHi(gameHiKey(i)));
+ }
+ json += "},";
+#endif
+ json += "\"lifeDensity\":" + String(settings.lifeDensity) + ",";
+ json += "\"lifeClockPos\":" + String(settings.lifeClockPos) + ",";
+ json += "\"tronBikeStyle\":" + String(settings.tronBikeStyle) + ",";
+ json += "\"vizStyle\":" + String(settings.vizStyle) + ",";
+ json += "\"vizRefreshHz\":" + String(settings.vizRefreshHz) + ",";
+ json += "\"vizBarStyle\":" + String(settings.vizBarStyle) + ",";
+ json += "\"scopeTrail\":" + String(settings.scopeTrail) + ",";
+ json += "\"scopeGain\":" + String(settings.scopeGain) + ",";
+ json += "\"boostAnimationRefresh\":" + String(settings.boostAnimationRefresh ? "true" : "false") + ",";
+ json += "\"enableScheduledDimming\":" + String(settings.enableScheduledDimming ? "true" : "false") + ",";
+ json += "\"marioSmoothAnimation\":" + String(settings.marioSmoothAnimation ? "true" : "false") + ",";
+ json += "\"marioIdleEncounters\":" + String(settings.marioIdleEncounters ? "true" : "false") + ",";
+ json += "\"pongHorizontalBounce\":" + String(settings.pongHorizontalBounce ? "true" : "false") + ",";
+ json += "\"pacmanPelletRandomSpacing\":" + String(settings.pacmanPelletRandomSpacing ? "true" : "false") + ",";
+ json += "\"pacmanBounceEnabled\":" + String(settings.pacmanBounceEnabled ? "true" : "false") + ",";
+ json += "\"snakeWallBorder\":" + String(settings.snakeWallBorder ? "true" : "false") + ",";
+ json += "\"snakeShowDate\":" + String(settings.snakeShowDate ? "true" : "false") + ",";
+ json += "\"tetrisIdleTumble\":" + String(settings.tetrisIdleTumble ? "true" : "false") + ",";
+ json += "\"tetrisShowDate\":" + String(settings.tetrisShowDate ? "true" : "false") + ",";
+ json += "\"tetrisDigitBounce\":" + String(settings.tetrisDigitBounce ? "true" : "false") + ",";
+ json += "\"tetrisSmoothGame\":" + String(settings.tetrisSmoothGame ? "true" : "false") + ",";
+ json += "\"asteroidsShowDate\":" + String(settings.asteroidsShowDate ? "true" : "false") + ",";
+ json += "\"asteroidsTransparent\":" + String(settings.asteroidsTransparent ? "true" : "false") + ",";
+ json += "\"dinoShowClouds\":" + String(settings.dinoShowClouds ? "true" : "false") + ",";
+ json += "\"dinoShowDate\":" + String(settings.dinoShowDate ? "true" : "false") + ",";
+ json += "\"lifeShowDate\":" + String(settings.lifeShowDate ? "true" : "false") + ",";
+ json += "\"lifeSmallClock\":" + String(settings.lifeSmallClock ? "true" : "false") + ",";
+ json += "\"lifeSmallCells\":" + String(settings.lifeSmallCells ? "true" : "false") + ",";
+ json += "\"dragonIdleTricks\":" + String(settings.dragonIdleTricks ? "true" : "false") + ",";
+ json += "\"weatherLat\":" + String(settings.weatherLat, 4) + ",";
+ json += "\"weatherLon\":" + String(settings.weatherLon, 4) + ",";
+ json += "\"weatherUseFahrenheit\":" + String(settings.weatherUseFahrenheit ? "true" : "false") + ",";
+ json += "\"weatherLayout\":" + String(settings.weatherLayout) + ",";
+ json += "\"tronShowGrid\":" + String(settings.tronShowGrid ? "true" : "false") + ",";
+ json += "\"tronShowBorder\":" + String(settings.tronShowBorder ? "true" : "false") + ",";
+ json += "\"vizPeakDots\":" + String(settings.vizPeakDots ? "true" : "false") + ",";
+ json += "\"vizSilenceTimeout\":" + String(settings.vizSilenceTimeout) + ",";
+ json += "\"vizShowClock\":" + String(settings.vizShowClock ? "true" : "false") + ",";
+ json += "\"scopeGrid\":" + String(settings.scopeGrid ? "true" : "false") + ",";
+ json += "\"scopeFill\":" + String(settings.scopeFill ? "true" : "false") + ",";
 
  // Metric labels
  json += "\"metricLabels\":[";
@@ -1434,6 +2037,15 @@ void handleImportConfig() {
  }
 
  // Import clock settings
+ if (!doc["cycleConfig"].isNull()) {
+ const char* cycle = doc["cycleConfig"];
+ CycleEntry checkedCycle[CYCLE_COUNT];
+ if (!cycle || strlen(cycle) >= sizeof(settings.cycleConfig) || !parseCycleConfig(cycle, checkedCycle)) {
+ server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid rotation\"}");
+ return;
+ }
+ strcpy(settings.cycleConfig, cycle);
+ }
  if (!doc["clockStyle"].isNull()) settings.clockStyle = doc["clockStyle"];
  if (!doc["timezoneString"].isNull()) {
  const char* tz = doc["timezoneString"];
@@ -1458,6 +2070,10 @@ void handleImportConfig() {
  if (!doc["useRpmKFormat"].isNull()) settings.useRpmKFormat = doc["useRpmKFormat"];
  if (!doc["useNetworkMBFormat"].isNull()) settings.useNetworkMBFormat = doc["useNetworkMBFormat"];
  if (!doc["showIPAtBoot"].isNull()) settings.showIPAtBoot = doc["showIPAtBoot"];
+ if (!doc["udpPort"].isNull()) {
+   long p = doc["udpPort"];
+   if (p >= 1024 && p <= 65535) settings.udpPort = (uint16_t)p;
+ }
  if (!doc["deviceName"].isNull()) {
    const char* name = doc["deviceName"];
    if (name && strlen(name) > 0 && strlen(name) <= 31) {
@@ -1473,6 +2089,114 @@ void handleImportConfig() {
    const char* s = doc["ntpServer2"];
    if (s) { strncpy(settings.ntpServer2, s, 63); settings.ntpServer2[63] = '\0'; }
  }
+
+ // Display, animation and visualizer settings (see handleExportConfig).
+ if (!doc["colonBlinkMode"].isNull()) settings.colonBlinkMode = doc["colonBlinkMode"];
+ if (!doc["colonBlinkRate"].isNull()) settings.colonBlinkRate = doc["colonBlinkRate"];
+ if (!doc["refreshRateMode"].isNull()) settings.refreshRateMode = doc["refreshRateMode"];
+ if (!doc["refreshRateHz"].isNull()) settings.refreshRateHz = doc["refreshRateHz"];
+ if (!doc["displayBrightness"].isNull()) settings.displayBrightness = doc["displayBrightness"];
+#if TOUCH_BUTTON_ENABLED
+ if (!doc["touchButtonPin"].isNull()) {
+ int importedTouchPin = doc["touchButtonPin"];
+ if (isValidTouchPin(importedTouchPin)) applyTouchButtonPin((uint8_t)importedTouchPin);
+ }
+#endif
+ if (!doc["dimStartHour"].isNull()) settings.dimStartHour = doc["dimStartHour"];
+ if (!doc["dimEndHour"].isNull()) settings.dimEndHour = doc["dimEndHour"];
+ if (!doc["dimBrightness"].isNull()) settings.dimBrightness = doc["dimBrightness"];
+ if (!doc["marioBounceHeight"].isNull()) settings.marioBounceHeight = doc["marioBounceHeight"];
+ if (!doc["marioBounceSpeed"].isNull()) settings.marioBounceSpeed = doc["marioBounceSpeed"];
+ if (!doc["marioWalkSpeed"].isNull()) settings.marioWalkSpeed = doc["marioWalkSpeed"];
+ if (!doc["marioEncounterFreq"].isNull()) settings.marioEncounterFreq = doc["marioEncounterFreq"];
+ if (!doc["marioEncounterSpeed"].isNull()) settings.marioEncounterSpeed = doc["marioEncounterSpeed"];
+ if (!doc["spaceCharacterType"].isNull()) settings.spaceCharacterType = doc["spaceCharacterType"];
+ if (!doc["spacePatrolSpeed"].isNull()) settings.spacePatrolSpeed = doc["spacePatrolSpeed"];
+ if (!doc["spaceAttackSpeed"].isNull()) settings.spaceAttackSpeed = doc["spaceAttackSpeed"];
+ if (!doc["spaceLaserSpeed"].isNull()) settings.spaceLaserSpeed = doc["spaceLaserSpeed"];
+ if (!doc["spaceExplosionGravity"].isNull()) settings.spaceExplosionGravity = doc["spaceExplosionGravity"];
+ if (!doc["pongBallSpeed"].isNull()) settings.pongBallSpeed = doc["pongBallSpeed"];
+ if (!doc["pongBounceStrength"].isNull()) settings.pongBounceStrength = doc["pongBounceStrength"];
+ if (!doc["pongBounceDamping"].isNull()) settings.pongBounceDamping = doc["pongBounceDamping"];
+ if (!doc["pongPaddleWidth"].isNull()) settings.pongPaddleWidth = doc["pongPaddleWidth"];
+ if (!doc["pacmanSpeed"].isNull()) settings.pacmanSpeed = doc["pacmanSpeed"];
+ if (!doc["pacmanEatingSpeed"].isNull()) settings.pacmanEatingSpeed = doc["pacmanEatingSpeed"];
+ if (!doc["pacmanMouthSpeed"].isNull()) settings.pacmanMouthSpeed = doc["pacmanMouthSpeed"];
+ if (!doc["pacmanPelletCount"].isNull()) settings.pacmanPelletCount = doc["pacmanPelletCount"];
+ if (!doc["snakeSpeed"].isNull()) settings.snakeSpeed = doc["snakeSpeed"];
+ if (!doc["snakeLength"].isNull()) settings.snakeLength = doc["snakeLength"];
+ if (!doc["tetrisFallSpeed"].isNull()) settings.tetrisFallSpeed = doc["tetrisFallSpeed"];
+ if (!doc["tetrisBlockStyle"].isNull()) settings.tetrisBlockStyle = doc["tetrisBlockStyle"];
+ if (!doc["tetrisAnimStyle"].isNull()) settings.tetrisAnimStyle = doc["tetrisAnimStyle"];
+ if (!doc["tetrisDatePosition"].isNull()) settings.tetrisDatePosition = doc["tetrisDatePosition"];
+ if (!doc["tetrisDotSpeed"].isNull()) settings.tetrisDotSpeed = doc["tetrisDotSpeed"];
+ if (!doc["tetrisDotOrder"].isNull()) settings.tetrisDotOrder = doc["tetrisDotOrder"];
+ if (!doc["asteroidsShipSpeed"].isNull()) settings.asteroidsShipSpeed = doc["asteroidsShipSpeed"];
+ if (!doc["asteroidsRockCount"].isNull()) settings.asteroidsRockCount = doc["asteroidsRockCount"];
+ if (!doc["asteroidsRockSpeed"].isNull()) settings.asteroidsRockSpeed = doc["asteroidsRockSpeed"];
+ if (!doc["dinoSpeed"].isNull()) settings.dinoSpeed = doc["dinoSpeed"];
+ if (!doc["dinoCactusFreq"].isNull()) settings.dinoCactusFreq = doc["dinoCactusFreq"];
+ if (!doc["lifeSpeed"].isNull()) settings.lifeSpeed = doc["lifeSpeed"];
+ if (!doc["gameIdleExitMin"].isNull()) settings.gameIdleExitMin = doc["gameIdleExitMin"];
+ if (!doc["blocksStartLevel"].isNull()) settings.blocksStartLevel = doc["blocksStartLevel"];
+ if (!doc["gameRumble"].isNull()) settings.gameRumble = doc["gameRumble"];
+ if (!doc["blocksStickDrop"].isNull()) settings.blocksStickDrop = doc["blocksStickDrop"];
+ if (!doc["blocksGhost"].isNull()) settings.blocksGhost = doc["blocksGhost"];
+#if GAMEPAD_ENABLED
+ for (uint8_t i = 0; i < gameCount(); i++) {
+   JsonVariant hi = doc["gameHi"][gameHiKey(i)];
+   if (hi.is<uint32_t>()) gameStoreHi(gameHiKey(i), hi.as<uint32_t>());
+ }
+#endif
+ if (!doc["lifeDensity"].isNull()) settings.lifeDensity = doc["lifeDensity"];
+ if (!doc["lifeClockPos"].isNull()) settings.lifeClockPos = doc["lifeClockPos"];
+ if (!doc["tronBikeStyle"].isNull()) settings.tronBikeStyle = doc["tronBikeStyle"];
+ if (!doc["vizStyle"].isNull()) settings.vizStyle = doc["vizStyle"];
+ if (!doc["vizRefreshHz"].isNull()) settings.vizRefreshHz = doc["vizRefreshHz"];
+ if (!doc["vizBarStyle"].isNull()) settings.vizBarStyle = doc["vizBarStyle"];
+ if (!doc["scopeTrail"].isNull()) settings.scopeTrail = doc["scopeTrail"];
+ if (!doc["scopeGain"].isNull()) settings.scopeGain = doc["scopeGain"];
+ if (!doc["boostAnimationRefresh"].isNull()) settings.boostAnimationRefresh = doc["boostAnimationRefresh"];
+ if (!doc["enableScheduledDimming"].isNull()) settings.enableScheduledDimming = doc["enableScheduledDimming"];
+ if (!doc["marioSmoothAnimation"].isNull()) settings.marioSmoothAnimation = doc["marioSmoothAnimation"];
+ if (!doc["marioIdleEncounters"].isNull()) settings.marioIdleEncounters = doc["marioIdleEncounters"];
+ if (!doc["pongHorizontalBounce"].isNull()) settings.pongHorizontalBounce = doc["pongHorizontalBounce"];
+ if (!doc["pacmanPelletRandomSpacing"].isNull()) settings.pacmanPelletRandomSpacing = doc["pacmanPelletRandomSpacing"];
+ if (!doc["pacmanBounceEnabled"].isNull()) settings.pacmanBounceEnabled = doc["pacmanBounceEnabled"];
+ if (!doc["snakeWallBorder"].isNull()) settings.snakeWallBorder = doc["snakeWallBorder"];
+ if (!doc["snakeShowDate"].isNull()) settings.snakeShowDate = doc["snakeShowDate"];
+ if (!doc["tetrisIdleTumble"].isNull()) settings.tetrisIdleTumble = doc["tetrisIdleTumble"];
+ if (!doc["tetrisShowDate"].isNull()) settings.tetrisShowDate = doc["tetrisShowDate"];
+ if (!doc["tetrisDigitBounce"].isNull()) settings.tetrisDigitBounce = doc["tetrisDigitBounce"];
+ if (!doc["tetrisSmoothGame"].isNull()) settings.tetrisSmoothGame = doc["tetrisSmoothGame"];
+ if (!doc["asteroidsShowDate"].isNull()) settings.asteroidsShowDate = doc["asteroidsShowDate"];
+ if (!doc["asteroidsTransparent"].isNull()) settings.asteroidsTransparent = doc["asteroidsTransparent"];
+ if (!doc["dinoShowClouds"].isNull()) settings.dinoShowClouds = doc["dinoShowClouds"];
+ if (!doc["dinoShowDate"].isNull()) settings.dinoShowDate = doc["dinoShowDate"];
+ if (!doc["lifeShowDate"].isNull()) settings.lifeShowDate = doc["lifeShowDate"];
+ if (!doc["lifeSmallClock"].isNull()) settings.lifeSmallClock = doc["lifeSmallClock"];
+ if (!doc["lifeSmallCells"].isNull()) settings.lifeSmallCells = doc["lifeSmallCells"];
+ if (!doc["dragonIdleTricks"].isNull()) settings.dragonIdleTricks = doc["dragonIdleTricks"];
+ if (doc["weatherLat"].is<float>() && doc["weatherLon"].is<float>()) {
+ float lat = doc["weatherLat"], lon = doc["weatherLon"];
+ if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+ settings.weatherLat = lat;
+ settings.weatherLon = lon;
+ }
+ }
+ if (!doc["weatherUseFahrenheit"].isNull()) settings.weatherUseFahrenheit = doc["weatherUseFahrenheit"];
+ if (!doc["weatherLayout"].isNull()) settings.weatherLayout = doc["weatherLayout"];
+ weatherSettingsChanged();
+ if (!doc["tronShowGrid"].isNull()) settings.tronShowGrid = doc["tronShowGrid"];
+ if (!doc["tronShowBorder"].isNull()) settings.tronShowBorder = doc["tronShowBorder"];
+ if (!doc["vizPeakDots"].isNull()) settings.vizPeakDots = doc["vizPeakDots"];
+ if (!doc["vizSilenceTimeout"].isNull()) {
+   long q = doc["vizSilenceTimeout"];
+   if (q >= 0 && q <= 255) settings.vizSilenceTimeout = (uint8_t)q;
+ }
+ if (!doc["vizShowClock"].isNull()) settings.vizShowClock = doc["vizShowClock"];
+ if (!doc["scopeGrid"].isNull()) settings.scopeGrid = doc["scopeGrid"];
+ if (!doc["scopeFill"].isNull()) settings.scopeFill = doc["scopeFill"];
 
  // Import metric labels
  if (!doc["metricLabels"].isNull()) {
@@ -1575,9 +2299,13 @@ void handleImportConfig() {
    }
  }
 
+ // An imported file can carry anything, so clamp before persisting.
+ validateSettings();
+
  // Save imported settings
  saveSettings();
  applyTimezone();
+ beginStatsUdp();   // Imported config can move the stats port
  ntpSynced = false; // Force NTP resync after config import
 
  // Imported config can change clockStyle. Reset every clock's animation

@@ -83,73 +83,169 @@ void assertBounds(int value, int minVal, int maxVal, const char* name) {
 #if TOUCH_BUTTON_ENABLED
 // ========== Touch Button Implementation ==========
 
-static int lastButtonState = !TOUCH_ACTIVE_LEVEL;  // Initial state (opposite of active)
-static unsigned long lastDebounceTime = 0;
-static unsigned long buttonPressStartTime = 0;  // Track when button was pressed
-static bool buttonIsPressed = false;  // Button is currently pressed (after debounce)
-static bool buttonHandled = false;  // Button action already handled
+// Edges are captured in an interrupt with their own timestamps. Polling the
+// pin from loop() lost taps whenever a frame or a clock reset held the loop
+// longer than the touch lasted, and stretched or shrank press durations by
+// however long the loop was busy.
+#define TOUCH_EDGE_QUEUE 16
+static volatile uint32_t edgeTime[TOUCH_EDGE_QUEUE];
+static volatile uint8_t edgeLevel[TOUCH_EDGE_QUEUE];
+static volatile uint8_t edgeHead = 0;
+static volatile uint8_t edgeTail = 0;
+static volatile uint8_t touchIsrPin = TOUCH_BUTTON_PIN;
+static int8_t touchAttachedPin = -1;
+
+static unsigned long buttonPressStartTime = 0;
+static bool buttonIsPressed = false;
+static bool buttonHandled = false;  // The hold already acted as an LED ramp
+static bool mediumPressPending = false;
+static unsigned long lastTapTime = 0;
+// A pulse shorter than this is noise, not a finger.
+static const unsigned long TOUCH_MIN_PRESS_MS = 15;
+
+static const unsigned long MEDIUM_PRESS_THRESHOLD = 500;
+static const unsigned long LONG_PRESS_THRESHOLD = 1000;
+
+// The touch pin is configurable at runtime because the GPIO the TTP223 lands
+// on is a board decision, not a firmware one - the reference wiring uses GPIO 7
+// but the sponsored carrier PCB routes it to GPIO 21. TOUCH_BUTTON_PIN stays
+// the default for a device that has never been configured.
+bool isValidTouchPin(int pin) {
+  if (pin < 0 || pin > TOUCH_PIN_MAX) return false;
+#if CONFIG_IDF_TARGET_ESP32S3
+  if (pin >= 22 && pin <= 25) return false; // not bonded out
+  if (pin >= 26 && pin <= 37) return false; // SPI flash/PSRAM (33-37 on octal modules)
+#if ARDUINO_USB_CDC_ON_BOOT
+  if (pin == 19 || pin == 20) return false; // USB D-/D+ carries Serial and OTA-less reflashing
+#endif
+#else
+  if (pin >= 11 && pin <= 17) return false; // SPI flash bus + VDD_SPI
+#if ARDUINO_USB_CDC_ON_BOOT
+  if (pin == 18 || pin == 19) return false; // USB D-/D+ carries Serial and OTA-less reflashing
+#endif
+#endif
+#if DISPLAY_INTERFACE == 1
+  if (pin == SPI_MOSI_PIN || pin == SPI_SCK_PIN || pin == SPI_CS_PIN ||
+      pin == SPI_DC_PIN) return false;
+  if (SPI_RST_PIN >= 0 && pin == SPI_RST_PIN) return false;
+#else
+  if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) return false;
+#endif
+#if LED_PWM_ENABLED
+  if (pin == LED_PWM_PIN) return false;
+#endif
+  return true;
+}
+
+const char* touchPinNote(int pin) {
+  switch (pin) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    case 0: case 3: case 45: case 46: return "strapping";
+    case 19: case 20: return "USB";
+    case 43: return "UART0 TX";
+    case 44: return "UART0 RX";
+#else
+    case 2: case 8: case 9: return "strapping";
+    case 18: case 19: return "USB";
+    case 20: return "UART0 RX";
+    case 21: return "UART0 TX";
+#endif
+    default: return "";
+  }
+}
+
+void applyTouchButtonPin(uint8_t pin) {
+  if (!isValidTouchPin(pin)) return;
+  if (pin != settings.touchButtonPin) {
+    pinMode(settings.touchButtonPin, INPUT); // drop the pulldown on the old pin
+    settings.touchButtonPin = pin;
+  }
+  initTouchButton();
+}
+
+static void IRAM_ATTR touchEdgeIsr() {
+  uint8_t next = (edgeHead + 1) % TOUCH_EDGE_QUEUE;
+  if (next == edgeTail) return;
+  edgeTime[edgeHead] = millis();
+  edgeLevel[edgeHead] = digitalRead(touchIsrPin);
+  edgeHead = next;
+}
+
+void resetTouchButtonState();
 
 void initTouchButton() {
-  pinMode(TOUCH_BUTTON_PIN, INPUT_PULLDOWN);
-  lastButtonState = digitalRead(TOUCH_BUTTON_PIN);
-  lastDebounceTime = millis();
-  buttonIsPressed = false;
-  buttonHandled = false;
+  if (!isValidTouchPin(settings.touchButtonPin)) {
+    settings.touchButtonPin = TOUCH_BUTTON_PIN;
+  }
+  if (touchAttachedPin >= 0) detachInterrupt(touchAttachedPin);
+  pinMode(settings.touchButtonPin, INPUT_PULLDOWN);
+  touchIsrPin = settings.touchButtonPin;
+  resetTouchButtonState();
+  attachInterrupt(settings.touchButtonPin, touchEdgeIsr, CHANGE);
+  touchAttachedPin = settings.touchButtonPin;
 
   Serial.print("Touch button initialized on GPIO ");
-  Serial.print(TOUCH_BUTTON_PIN);
+  Serial.print(settings.touchButtonPin);
   Serial.print(" (active ");
   Serial.print(TOUCH_ACTIVE_LEVEL == HIGH ? "HIGH" : "LOW");
   Serial.println(")");
 }
 
-bool checkTouchButtonPressed() {
-  int reading = digitalRead(TOUCH_BUTTON_PIN);
-  bool pressed = false;
-
-  // Check if button state changed (noise or actual press)
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();  // Reset debounce timer
-  }
-
-  // Check if button is stable for debounce period
-  if ((millis() - lastDebounceTime) > TOUCH_DEBOUNCE_MS) {
-    // Button just pressed (after debounce)
-    if (reading == TOUCH_ACTIVE_LEVEL && !buttonIsPressed) {
+// Feed one edge to the press state machine. Returns true when it completes a
+// short tap.
+static bool touchEdge(bool active, unsigned long t) {
+  if (active) {
+    if (!buttonIsPressed) {
       buttonIsPressed = true;
-      buttonPressStartTime = millis();
+      buttonPressStartTime = t;
       buttonHandled = false;
-      // Don't return true yet - wait to see if it's a short or long press
     }
-    // Button just released (after debounce)
-    else if (reading != TOUCH_ACTIVE_LEVEL && buttonIsPressed) {
-      buttonIsPressed = false;
-      if (!buttonHandled) {
-        unsigned long pressDuration = millis() - buttonPressStartTime;
+    return false;
+  }
+  if (!buttonIsPressed) return false;
+  buttonIsPressed = false;
+  unsigned long duration = t - buttonPressStartTime;
+  bool handled = buttonHandled;
+  buttonHandled = false;
+  if (handled || duration < TOUCH_MIN_PRESS_MS) return false;
 #if LED_PWM_ENABLED
-        // Only fire short press for quick taps (< 500ms)
-        // Medium press (500-1000ms) is handled by handleTouchLED()
-        if (pressDuration < 500) {
-          pressed = true;
-          Serial.println("Touch button PRESSED (short press)");
-        }
-#else
-        pressed = true;
-        Serial.println("Touch button PRESSED (short press)");
+  // Quick tap < 500 ms, medium press 500-1000 ms toggles the LED
+  if (duration >= MEDIUM_PRESS_THRESHOLD) {
+    if (duration < LONG_PRESS_THRESHOLD) mediumPressPending = true;
+    return false;
+  }
 #endif
-      }
-      buttonHandled = false;  // Reset for next press
+  lastTapTime = t;
+  return true;
+}
+
+// Returns true once per completed tap; call until it returns false.
+// `when` receives the release time of that tap.
+bool checkTouchButtonPressed(unsigned long *when) {
+  while (edgeTail != edgeHead) {
+    uint8_t i = edgeTail;
+    bool active = edgeLevel[i] == TOUCH_ACTIVE_LEVEL;
+    unsigned long t = edgeTime[i];
+    edgeTail = (i + 1) % TOUCH_EDGE_QUEUE;
+    if (touchEdge(active, t)) {
+      if (when) *when = lastTapTime;
+      return true;
     }
   }
-
-  lastButtonState = reading;
-  return pressed;
+  // Resync if an edge was lost (queue overflow, pin rebind mid-touch).
+  bool active = digitalRead(settings.touchButtonPin) == TOUCH_ACTIVE_LEVEL;
+  if (edgeTail == edgeHead && active != buttonIsPressed && touchEdge(active, millis())) {
+    if (when) *when = lastTapTime;
+    return true;
+  }
+  return false;
 }
 
 void resetTouchButtonState() {
+  edgeTail = edgeHead;
   buttonIsPressed = false;
   buttonHandled = false;
-  lastButtonState = digitalRead(TOUCH_BUTTON_PIN);
+  mediumPressPending = false;
 }
 
 #endif
@@ -190,12 +286,8 @@ void enableLED(bool enable) {
 // ========== LED Gesture Control ==========
 // Quick tap (< 500ms): clock action (handled by checkTouchButtonPressed)
 // Medium press (500ms-1s, release): toggle LED on/off
-// Long hold (> 1s, keep holding): ramp brightness up/down
+// Long hold (> 1s, keep holding): ramp brightness, direction alternates per hold
 // Gamma-corrected ramp for natural feel.
-
-extern bool buttonIsPressed;  // Referenced from touch button code above
-extern unsigned long buttonPressStartTime;
-extern bool buttonHandled;
 
 // Gamma correction: maps linear position (0-255) to perceived brightness
 // Quadratic approximation of gamma ~2.0 — no floats in hot path
@@ -205,8 +297,6 @@ static uint8_t gammaCorrect(uint8_t pos) {
   return val >= 255 ? 254 : val;
 }
 
-static const unsigned long MEDIUM_PRESS_THRESHOLD = 500;
-static const unsigned long LONG_PRESS_THRESHOLD = 1000;
 static const unsigned long LED_RAMP_INTERVAL_MS = 10; // 10ms per step → ~2.5s full range
 
 void handleTouchLED() {
@@ -214,7 +304,6 @@ void handleTouchLED() {
   static bool rampUp = true;
   static uint8_t rampPosition = 0;
   static unsigned long lastRampUpdate = 0;
-  static bool prevPressed = false;
 
   bool held = buttonIsPressed && !buttonHandled;
   unsigned long pressDuration = millis() - buttonPressStartTime;
@@ -224,16 +313,17 @@ void handleTouchLED() {
     buttonHandled = true; // Block short press
 
     if (!rampActive) {
-      // First frame: determine direction
+      // First frame: determine direction. Each hold reverses the previous
+      // one, so overshooting is fixed by letting go and holding again. The
+      // ends of the range force the only direction that does anything.
       if (!settings.ledEnabled || settings.ledBrightness == 0) {
         rampUp = true;
         rampPosition = 0;
         settings.ledEnabled = true;
       } else {
-        rampUp = false;
+        rampUp = settings.ledBrightness >= 254 ? false : !rampUp;
         // Inverse gamma to find ramp position from current brightness
         rampPosition = (uint8_t)sqrtf(float(settings.ledBrightness) * 255.0f);
-        if (rampPosition > 255) rampPosition = 255;
       }
       rampActive = true;
       lastRampUpdate = millis();
@@ -258,27 +348,21 @@ void handleTouchLED() {
         ledcWrite(LED_PWM_CHANNEL, settings.ledBrightness);
       }
     }
-    prevPressed = buttonIsPressed;
     return;
   }
 
-  // Detect release moment
-  if (prevPressed && !buttonIsPressed) {
-    if (rampActive) {
-      // Was ramping → save brightness
-      rampActive = false;
-      saveSettings();
-    } else {
-      // Check for medium press (500ms-1000ms) → toggle LED
-      if (pressDuration >= MEDIUM_PRESS_THRESHOLD && pressDuration < LONG_PRESS_THRESHOLD) {
-        enableLED(!settings.ledEnabled);
-        saveSettings();
-        Serial.println(settings.ledEnabled ? "Medium press: LED ON" : "Medium press: LED OFF");
-      }
-    }
+  if (rampActive) {
+    // Released after a ramp: keep the level
+    rampActive = false;
+    saveLedState();
   }
 
-  prevPressed = buttonIsPressed;
+  if (mediumPressPending) {
+    mediumPressPending = false;
+    enableLED(!settings.ledEnabled);
+    saveLedState();
+    Serial.println(settings.ledEnabled ? "Medium press: LED ON" : "Medium press: LED OFF");
+  }
 }
 
 #endif // TOUCH_BUTTON_ENABLED

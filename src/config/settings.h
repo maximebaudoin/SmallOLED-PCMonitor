@@ -16,6 +16,10 @@ void loadSettings();
 // Save current settings to NVS
 void saveSettings();
 
+// Persist single items without the ~220 ms full rewrite
+void saveClockStyle();
+void saveLedState();
+
 // Brightness helpers
 uint8_t sanitizeBrightnessValue(uint8_t value);
 bool isZeroBrightnessAllowed();

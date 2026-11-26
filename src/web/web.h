@@ -40,9 +40,27 @@ void handleStatus();
 void handleDisplayOn();
 void handleDisplayOff();
 void handleSetBrightness();
+#if LED_PWM_ENABLED
+void handleLedOn();
+void handleLedOff();
+void handleLedBrightness();
+#endif
 void handleModeClock();
 void handleModeAuto();
+void handleModeViz();
+void handleSetVizStyle();
+#if VIZ_DEBUG_FB
+void handleDebugFramebuffer();
+#endif
 void handleSetClockStyle();
+void handleDragonBallDemo();
+#if GAMEPAD_ENABLED
+void handleGameStart();
+void handleGameStop();
+void handleGameStatus();
+void handleGameForget();
+void handleGameResetHi();
+#endif
 void handleReboot();
 
 #endif // WEB_H

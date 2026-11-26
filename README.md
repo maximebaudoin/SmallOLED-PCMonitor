@@ -43,16 +43,30 @@ Some of those faulty boards have antenna too close to other components. Like in 
 
 A real-time PC monitoring system that displays CPU, RAM, GPU, and disk stats on a small OLED screen using ESP32 and a companion Python script.
 
+## Custom PCB, sponsored by PCBWay
+
+There is now a 27 x 27 mm carrier PCB that holds the ESP32-C3 SuperMini, the OLED header and the optional filament LED driver on one board, instead of wiring it by hand. **[PCBWay](https://www.pcbway.com/) sponsored this project and manufactured the boards**, SMT assembly included, shown below and in the assembly video.
+
+![Finished SmallOLED builds next to unpopulated carrier PCBs](img/pcbway-carrier-builds.jpg)
+
+- **[Board details and build notes](CARRIER-PCB.md)**
+- **[Order the board from PCBWay](https://www.pcbway.com/project/shareproject/SmallOLED_Carrier_27x27_mm_ESP32_C3_SuperMini_board_for_an_I2C_OLED_PC_stats_m_c42149ed.html)** (gerbers, BOM and pick and place files are attached to the shared project)
+- **[Full assembly video](https://youtu.be/5O7uISlaXd4)**: flashing from the browser, soldering, antenna mod and enclosure
+- **Cases for this board**: [0.96" (3MF)](case/SmallOLED-Case-0.96-PCB.3mf) and [1.3" retro (3MF)](case/SmallOLED-Case-1.3-Retro-PCB.3mf), two plates each. See [CARRIER-PCB.md](CARRIER-PCB.md#3d-printed-cases) before printing the 1.3" one, it needs a panel-mount USB-C on a lead
+
 ## Features
 
 - **Dual Display Modes:**
   - **PC Online**: Real-time stats with customizable metrics and positions
-  - **PC Offline**: Animated clock (Mario, Space Invaders, Arkanoid, Pac-Man, Snake, Tetris, Asteroids, Dino Runner, Standard, or Large styles, plus a Cycle All mode)
+  - **PC Offline**: Animated clock (Mario, Space Invaders, Arkanoid, Pac-Man, Snake, Tetris, Asteroids, Dino Runner, TRON, Game of Life, Dragon Ball, Weather, Standard, or Large styles, plus a Cycle All mode)
+- **Audio Visualizer**: Live spectrum bars or an oscilloscope driven by whatever your PC is playing, streamed by the companion app
+- **Game Mode**: Six small games on the OLED (Falling Blocks, Snake, Bricks, Space Rocks, Runner, Defenders), played with an Xbox Wireless Controller over Bluetooth LE
 - **PC Companion App (v4, Windows + Linux)**:
   - Web-style config window that mirrors the device portal 1:1
   - Live 1:1 OLED preview with drag-and-drop layout
   - Sensor picker with live values, up to 20 metrics
   - Custom labels (max 10 characters), number formats, quick templates
+  - Optional audio visualizer stream, with auto-switch when music starts
   - Runs in a native window + system tray; **Start with Windows** autostart
   - Windows prebuilt exe (no Python) or Linux from source
 - **Web Configuration Portal**: Customize all settings via browser
@@ -74,15 +88,14 @@ A real-time PC monitoring system that displays CPU, RAM, GPU, and disk stats on 
 
 **Never done this before? Here's the simple version:**
 
-1. **Flash ESP32** - Open the [SmallOLED Web Flasher](https://keralots.github.io/SmallOLED-PCMonitor/) in desktop Chrome or Edge, pick your OLED, and click Install (no installation needed!)
+1. **Flash ESP32** - Open the [SmallOLED Web Flasher](https://smalloled.stolaris.dev/) in desktop Chrome or Edge, pick your OLED, and click Install (no installation needed!)
 2. **Connect ESP32 to WiFi** - Right after flashing, use the flasher's **Configure WiFi** step to send your network to the device over USB. (No web flasher? Join the "PCMonitor-Setup" network and open 192.168.4.1.)
 3. **Install LibreHardwareMonitor** (Windows only) - Download from [GitHub](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases), run as Admin (needed for temps/fans/GPU/power)
 4. **Get the companion app (v4 - recommended on both Windows and Linux):**
    - **Windows (easiest):** download `pc_stats_monitor_v4.exe` from the [latest release](https://github.com/Keralots/SmallOLED-PCMonitor/releases/latest) and double-click it - no Python needed. v4 gives a polished **web-style config window** (1:1 device preview, drag-and-drop layout, sensor picker, number formats, quick templates) that lives in the system tray. On the first run Windows SmartScreen may say *"Windows protected your PC"* - the exe is unsigned, so click **More info -> Run anyway**. This is normal for small unsigned tools.
    - **Linux:** `cd PC-Companion-App-v4/linux-companion`, then `python3 -m pip install -r requirements.txt` and `python3 pc_stats_monitor_v4_linux.py` (no build step). Same UI; opens a native window or your browser.
-   - **Classic scripts (legacy):** the older `pc_stats_monitor_v2.py` (Windows) / `pc_stats_monitor_v2_linux.py` (Linux) still work if you prefer them.
 5. **Configure in GUI** - Enter ESP32 IP address, select the sensors you want, click "Save & Start"
-6. **Position metrics** - In the v4 app use the **Layout & preview** page; with the v2 script, open the ESP32 IP in a browser and drag metrics on the preview
+6. **Position metrics** - use the app's **Layout & preview** page, or open the ESP32 IP in a browser and drag metrics on the device's own preview
 
 Done! Your PC stats will now appear on the OLED display.
 
@@ -91,7 +104,7 @@ For detailed instructions, keep reading below.
 ## Hardware Requirements
 
 ### ESP32 Setup
-- **ESP32-C3 Super Mini** (or compatible ESP32 board)
+- **ESP32-C3 Super Mini** or **ESP32-S3 Super Mini** (or any ESP32-C3 / ESP32-S3 board with 4MB+ flash). The S3 has its own firmware images, but the wiring below is identical for both chips.
 - **OLED Display** (128x64, I2C):
   - SSD1306 0.96" (most common)
   - SH1106 1.3" (larger, recommended)
@@ -117,7 +130,7 @@ This wiring is for 2.42" OLED. Use the same firmware as for 0.96" OLED for flash
 No need to change firmware, TTP223 and LED will work.
 
 If you are using 2N2222 and resistors for led here is the wiring:
-<img width="1297" height="905" alt="image" src="https://github.com/user-attachments/assets/35afc555-9f64-4d54-864b-816c04abfd04" />
+<img width="1127" height="745" alt="Screenshot 2026-10-01 160707" src="https://github.com/user-attachments/assets/b6ca1ce1-5ade-4e57-b4f3-69afaf8b9a05" />
 
 If you are using LDO6AJSA here is the wiring:
 <img width="941" height="660" alt="image" src="https://github.com/user-attachments/assets/1ff209f1-0437-42a3-b4c9-3db65d4d3e1e" />
@@ -130,9 +143,12 @@ The firmware supports an optional **TTP223 capacitive touch sensor** for physica
 
 | Gesture | Duration | Action |
 |---------|----------|--------|
-| Quick tap | < 500ms | **PC online:** Toggle metrics/clock. **PC offline:** Cycle clock styles |
+| Quick tap | < 500ms | **PC online:** Toggle metrics/clock. **PC offline:** Cycle clock styles. In game mode: leave it |
+| Triple tap | 3 quick taps | Start [game mode](#game-mode) |
 | Medium press | 500ms-1s, release | Toggle LED night light on/off |
-| Long hold | > 1s, keep holding | Ramp LED brightness up (if off) or down (if on). Release to keep. |
+| Long hold | > 1s, keep holding | Ramp LED brightness: up if off, otherwise each hold reverses the previous one (first hold dims). Release to keep. |
+
+Taps are counted until 350ms after the last release, so a single tap acts with that short delay.
 
 **Hardware Setup:**
 - Connect TTP223 signal pin to GPIO 7
@@ -154,9 +170,9 @@ The firmware supports an optional **TTP223 capacitive touch sensor** for physica
 
 A dedicated browser flasher that picks the right firmware for your OLED, installs it over USB, and then hands your WiFi to the device in the same tab. No separate flashing tool and no captive portal needed.
 
-1. Open the **[SmallOLED Web Flasher](https://keralots.github.io/SmallOLED-PCMonitor/)** in desktop **Chrome or Edge** (Web Serial is required, so Firefox, Safari and mobile won't work).
-2. Connect your ESP32-C3 via USB. If it constantly connects/disconnects, hold the **BOOT** button, connect to USB while still holding it, then release after connecting. Alternatively, hold **BOOT**, press **RESET** while holding **BOOT**, then release both buttons.
-3. Pick your OLED (0.96" SSD1306, 1.3" SH1106, 1.54" CH1116, or 2.42" SSD1309) and click **Install**. It erases and writes the full image at `0x0` in ~30 seconds.
+1. Open the **[SmallOLED Web Flasher](https://smalloled.stolaris.dev/)** in desktop **Chrome or Edge** (Web Serial is required, so Firefox, Safari and mobile won't work).
+2. Connect your ESP32-C3 or ESP32-S3 via USB. If it constantly connects/disconnects, hold the **BOOT** button, connect to USB while still holding it, then release after connecting. Alternatively, hold **BOOT**, press **RESET** while holding **BOOT**, then release both buttons.
+3. Pick your OLED (0.96" SSD1306, 1.3" SH1106, 1.54" CH1116, or 2.42" SSD1309) from the **ESP32-C3** or **ESP32-S3** group, matching your board, and click **Install**. It erases and writes the full image at `0x0` in ~30 seconds.
 4. When the install finishes, use the **Configure WiFi** step to send your home network to the device over USB. If you miss it, join the **PCMonitor-Setup** hotspot and open `192.168.4.1` instead.
 5. The device reboots, joins your WiFi, and shows its IP address on the OLED.
 
@@ -170,10 +186,10 @@ Prefer to flash the raw binary with your own tool? Download it from the latest r
 
 **Generic web flasher (esptool-js):**
 1. Visit [ESP Web Flasher](https://espressif.github.io/esptool-js/)
-2. Connect your ESP32-C3 via USB (use the BOOT/RESET trick above if it won't stay connected).
+2. Connect your ESP32-C3 or ESP32-S3 via USB (use the BOOT/RESET trick above if it won't stay connected).
 3. Click **"Connect"** and select your port
 4. Click **"Choose File"** and select the full image for your display, e.g. `firmware-<version>-OLED_0.96inch.bin`
-5. Make sure you pick firmware for correct OLED size version! It may initially work but you will get black screen after you reconnect device.
+5. Make sure you pick firmware for correct OLED size version! It may initially work but you will get black screen after you reconnect device. ESP32-S3 boards need the `ESP32-S3` images, e.g. `firmware-<version>-ESP32-S3-OLED_0.96inch.bin`.
 6. Set **Flash Address** to `0x0`
 7. Click **"Program"** and wait ~30 seconds
 8. Done! Then set up WiFi via the **PCMonitor-Setup** hotspot (see below).
@@ -182,6 +198,7 @@ Prefer to flash the raw binary with your own tool? Download it from the latest r
 - **Windows**: Run `flash.bat` and follow prompts
 - **Linux/Mac**: Run `./flash.sh` and follow prompts
 - **Manual**: `esptool.py --chip esp32c3 --port COM3 --baud 460800 write_flash 0x0 firmware-<version>-OLED_0.96inch.bin`
+- **Manual (ESP32-S3)**: `esptool.py --chip esp32s3 --port COM3 --baud 460800 write_flash 0x0 firmware-<version>-ESP32-S3-OLED_0.96inch.bin`
 
 #### Option C: Build from Source
 
@@ -214,7 +231,7 @@ Once connected to WiFi, access the full configuration page:
 ![ESP32 Web Portal - Clock Settings](img/ESP-WEBPortal1.png)
 
 2. **Clock Settings:**
-   - Idle clock style (Mario, Space Invaders, Arkanoid, Pac-Man, Snake, Tetris, Asteroids, Dino Runner, Standard, or Large, plus a Cycle All mode)
+   - Idle clock style (Mario, Space Invaders, Arkanoid, Pac-Man, Snake, Tetris, Asteroids, Dino Runner, TRON, Game of Life, Dragon Ball, Weather, Standard, or Large, plus a Cycle All mode)
    - Time format (12/24 hour)
    - Date format (DD/MM/YYYY, MM/DD/YYYY, or YYYY-MM-DD)
 
@@ -244,17 +261,11 @@ Once connected to WiFi, access the full configuration page:
 > all from the desktop, hosted in a native window + system tray.
 > - **Windows:** prebuilt **`pc_stats_monitor_v4.exe`** on the [latest release page](https://github.com/Keralots/SmallOLED-PCMonitor/releases/latest) - no Python needed. First run may trip Windows SmartScreen (unsigned exe): **More info -> Run anyway**. Source and the full guide live in [`PC-Companion-App-v4/win-companion/`](PC-Companion-App-v4/win-companion/).
 > - **Linux:** run from source in [`PC-Companion-App-v4/linux-companion/`](PC-Companion-App-v4/linux-companion/) (`pip install -r requirements.txt` then `python3 pc_stats_monitor_v4_linux.py`).
->
-> **Legacy:** the classic **`pc_stats_monitor_v2.py`** /
-> **`pc_stats_monitor_v2_linux.py`** scripts below still work if you prefer them.
 
-#### Prerequisites (legacy v2 script)
-- **Python 3.7+**
-- **LibreHardwareMonitor** (for hardware sensor monitoring)
-- **Note:** LibreHardwareMonitor 0.9.5+ changed its WMI backend. The Python script automatically detects this and falls back to the REST API. If using 0.9.5+, enable "Options > Remote Web Server > Run" in LibreHardwareMonitor.
+#### Installing Python (only if you run from source)
 
-#### Installing Python:
-For windows download [e.g. this version](https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe)
+The Windows exe bundles its own Python, so skip this unless you run the app from source (always the case on Linux).
+For Windows download [e.g. this version](https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe)
 Check both checkboxes on installation screen (to use admin rights and add python.exe to PATH)
 
 <img width="654" height="414" alt="Screenshot 2025-12-07 132252" src="https://github.com/user-attachments/assets/07d958e6-9776-4981-8971-c11d7d23d59a" />
@@ -270,6 +281,8 @@ At the end of installation, if asked to remove characters limit for path, agree 
 
 For version 0.9.5 and above check Web server option:
 ![lhw-webserver](img/LHW-WEBSERVER.png)
+
+LibreHardwareMonitor 0.9.5+ broke its WMI backend. The companion app detects that and falls back to the REST API, which is what the Web server option above serves - so on 0.9.5+ that option is not optional.
 
 
 #### Set up the companion app
@@ -289,16 +302,6 @@ python3 -m pip install -r requirements.txt
 python3 pc_stats_monitor_v4_linux.py
 ```
 
-<details>
-<summary>Legacy v2 script (optional)</summary>
-
-**Windows:** `pip install psutil pywin32 wmi pystray pillow` then `python pc_stats_monitor_v2.py`
-
-**Linux:** `pip install psutil tk` (or `sudo apt install python3-pip python3-tk -y`) then `python3 pc_stats_monitor_v2_linux.py`
-
-The v2 GUI opens automatically if no configuration exists.
-</details>
-
 ##### Step 2: Connect to your ESP32
 
 ![Companion app - connection](img/v4-connection.png)
@@ -309,6 +312,7 @@ On the **Connection** page:
 2. **UDP Port** (default 4210) and **Update Interval** (default 3s) - leave unless you changed them.
 3. **Sensor source** - leave on **Auto** (prefers the REST API, falls back to WMI). Only force a mode if you have a reason to.
 4. Click **Test connection** to confirm the device answers, then **Save connection**.
+5. **Autostart (optional).** On Windows, tick **Start with Windows** - saved instantly, launches minimized to the tray at login (per-user, no admin) and waits 10s for LibreHardwareMonitor to come up first. On Linux, `python3 pc_stats_monitor_v4_linux.py --autostart enable` installs a `smalloled-companion.service` systemd user unit (`--autostart disable` removes it).
 
 ##### Step 3: Pick the sensors to display
 
@@ -334,7 +338,7 @@ After the companion app starts sending data (arrange metrics in its **Layout & p
 3. You'll see all metrics received from your PC as draggable chips under a live OLED preview
 4. Drag a chip onto a slot (or tap a chip then a slot) to place it; optionally pair it with a companion metric. E.g. **"CPU: 10% 40C"** > shows usage and temperature of CPU.
 5. Use **progress bars** for visual representation (optional)
-6. Choose between **5-row** (more spacing) or **6-row** (compact) display modes on the Display layout page
+6. Choose between **5-row** (more spacing), **6-row** (compact) or the **large 2/3-row** display modes on the Display layout page
 
 **TIP:** Start with 1-2 metrics initially and slowly build entire layout.
 
@@ -342,110 +346,46 @@ After the companion app starts sending data (arrange metrics in its **Layout & p
 
 The display will update in real-time as you arrange metrics!
 
-##### Step 5: Enable Autostart (Optional)
-
-> **v4 app (Windows):** tick **Start with Windows** on the **Connection** page - saved instantly, launches minimized to the tray at login (per-user, no admin) and waits 10s for LibreHardwareMonitor to start first. The commands below are for the legacy v2 script.
-
-**Windows:**
-```bash
-python pc_stats_monitor_v2.py --autostart enable
-```
-
-This will:
-- Create a startup entry in Windows
-- Run minimized to system tray on boot
-- Right-click tray icon to configure or quit
-
-**Linux (systemd):**
-```bash
-python3 pc_stats_monitor_v2_linux.py --autostart enable
-```
-
-This creates a systemd user service that:
-- Starts automatically on boot
-- Restarts if it crashes
-- Check status: `systemctl --user status pc-monitor`
-- View logs: `journalctl --user -u pc-monitor -f`
-
-##### Common Commands
-
-**Edit Configuration:**
-```bash
-# Windows
-python pc_stats_monitor_v2.py --edit
-
-# Linux
-python3 pc_stats_monitor_v2_linux.py --edit
-```
-
-**Run in Background (Windows only):**
-```bash
-python pc_stats_monitor_v2.py --minimized
-```
-
-**Disable Autostart:**
-```bash
-# Windows
-python pc_stats_monitor_v2.py --autostart disable
-
-# Linux
-python3 pc_stats_monitor_v2_linux.py --autostart disable
-```
-
-##### Understanding Display Modes
-
-The firmware supports multiple display layouts:
-
-**5-Row Mode (Recommended):**
-- More spacing (13px between rows)
-- Better readability
-- Positions 0-9 available
-- 11px spacing with centered clock
-
-![5-Row Display](img/5rows.jpg)
-
-**6-Row Mode (Compact):**
-- Tighter spacing (10px between rows)
-- Fits more metrics
-- Positions 0-11 available
-
-![6-Row Display](img/6rows.jpg)
-
-**Large 2-Row / 3-Row Modes:**
-- Double-size text for readability at a distance
-- Single-column layout
-- Best for desk setups where you want a quick glance
-
-You can switch between modes in the ESP32 web interface under "Display Layout Settings".
-
-#### Legacy Script (Older Versions)
-
-If you're using firmware versions below 1.3.0, use the legacy scripts:
-- [pc_stats_monitor.py](old/pc_stats_monitor.py) for Windows
-- [pc_stats_monitor_linux.py](old/pc_stats_monitor_linux.py) for Linux
-
-These require manual configuration by editing the ESP32_IP in the script file.
-
 ## Usage
 
 ### Normal Operation
 1. **ESP32** should be powered and connected to WiFi
 2. **LibreHardwareMonitor** must be running on your PC
-3. **Python script** should be running
+3. **Companion app** should be running
 
 The OLED will display:
 - **PC Online**: Real-time stats (CPU, RAM, GPU temp, disk, fan speed)
-- **PC Offline**: Animated clock (choose from 10 styles in the web portal, or a Cycle All mode that rotates through them)
+- **PC Offline**: Animated clock (choose from 11 styles in the web portal, or a Cycle All mode that rotates through them)
 
 ### Display Modes
 
 **When PC is Online (receiving stats):**
+
+There are four stats layouts, switchable in the web portal under **Display layout**. All of them take custom labels, paired companion metrics and progress bars. Each clip below runs the same workload cycle - idle, load, cool down - so you can compare them.
+
+| | |
+|:---:|:---:|
+| ![5-row stats layout](img/screens/stats.gif)<br>**5 rows** - 13px spacing, positions 0-9. The default, and the easiest to read. | ![6-row stats layout](img/screens/stats-6row.gif)<br>**6 rows** - 10px spacing, positions 0-11. One more row of metrics. |
+| ![Large 3-row stats layout](img/screens/stats-large3.gif)<br>**Large 3 rows** - double-size text, single column, 3 metrics. | ![Large 2-row stats layout](img/screens/stats-large2.gif)<br>**Large 2 rows** - double-size text, 2 metrics, readable across a room. |
+
 - Real-time monitoring display with customizable labels
 - Shows CPU usage/temp, RAM usage, GPU temp, Disk usage, Fan/Pump speed
 - Progress bars for visual representation
+- The 5-row mode drops to 11px spacing when the clock is centered, to keep all five rows on screen
 - Automatically switches when PC sends data
 
 **When PC is Offline (idle mode):**
+
+Every clock below is captured at the 09:59 -> 10:00 rollover, the busiest case, since all four digits change at once.
+
+| | | |
+|:---:|:---:|:---:|
+| ![Mario Clock](img/clocks/mario.gif)<br>**Mario** | ![Space Invaders Clock](img/clocks/space.gif)<br>**Space Invaders** | ![Arkanoid Clock](img/clocks/arkanoid.gif)<br>**Arkanoid** |
+| ![Pac-Man Clock](img/clocks/pacman.gif)<br>**Pac-Man** | ![Snake Clock](img/clocks/snake.gif)<br>**Snake** | ![Tetris Clock](img/clocks/tetris.gif)<br>**Tetris** |
+| ![Asteroids Clock](img/clocks/asteroids.gif)<br>**Asteroids** | ![Dino Runner Clock](img/clocks/dino.gif)<br>**Dino Runner** | ![TRON Clock](img/clocks/tron.gif)<br>**TRON** |
+| ![Game of Life Clock](img/clocks/life.gif)<br>**Game of Life** | ![Dragon Ball Clock](img/clocks/dragonball.gif)<br>**Dragon Ball** | ![Standard Clock](img/clocks/standard.gif)<br>**Standard** |
+| ![Large Clock](img/clocks/large.gif)<br>**Large** | ![Weather Clock](img/clocks/weather.gif)<br>**Weather** | |
+
 - **Mario Clock**: Animated pixel Mario that jumps to "hit" digits when time changes
 - **Space Invaders Clock**: Invader/ship shoots lasers to change digits
 - **Arkanoid Clock**: Breakout-style ball physics destroy and rebuild digits
@@ -454,6 +394,10 @@ The OLED will display:
 - **Tetris Clock**: Block-grid digits sit low on the screen with the occasional tumbling tetromino. On each minute change the changed digits are rebuilt one at a time, either as drop-in slabs or as falling dots. Optional date row at the top or bottom.
 - **Asteroids Clock**: A wireframe vector clock - the ship drifts with inertia and splits tumbling rocks while idle, then aims at and shoots each changed digit into spinning line shards at the minute change. Optional date row.
 - **Dino Runner Clock**: A Chrome T-Rex homage - the dino runs and auto-jumps cacti over a scrolling ground with parallax clouds; at the minute change a pterodactyl swoops in, carries off the old digit, and the new one drops in from above. Optional clouds and date row.
+- **TRON Clock**: Two light cycles duel around the digits, leaving trails behind them (one solid, one dotted, so you can tell them apart). At the minute change one cycle is dispatched to retrace the changed digit stroke by stroke. Optional arena grid and border, and a choice of side-profile or overhead bike sprite.
+- **Game of Life Clock**: Conway's Game of Life runs around the digits. At the minute change the old digit dissolves into the colony, evolves for a moment, and the surviving cells fly back together into the new digit, which then fires off a glider. Long-lived cells erode and fresh gliders keep arriving, so nothing burns in. Adjustable speed and density, optional date row, and a small-clock mode (top, centre or bottom) that leaves most of the screen to the colony.
+- **Weather Clock**: Current conditions from [Open-Meteo](https://open-meteo.com/) (free, no account or API key). Five layouts: classic (clock, animated icon - sun and moon with stars, drifting clouds, rain, snow, fog, lightning, gusts when it is windy - temperature, and today's high/low and humidity alternating with sunrise/sunset), or current weather on the left with a forecast on the right: three days as rows, three days as columns, a 12-hour temperature curve over rain chances, or tomorrow in focus. Same layouts as on AnimatedPixelClock. Find your city in the web settings (the lookup runs in your browser), Celsius or Fahrenheit. The device fetches every 10 minutes, only while the clock is on screen or in the rotation.
+- **Dragon Ball Clock**: Goku lives on the ground below the time - he walks, runs kata, spars with his afterimage, rides the Flying Nimbus, collects Dragon Balls (seven summon Shenron) and now and then fights a visiting Vegeta or Piccolo. At the minute change he fires a Kamehameha that eats the old digit from below; when three or four digits change he goes Super Saiyan, the old digits crumble and lightning strikes in the new ones. Idle tricks can be switched off, leaving him to just walk.
 - **Standard Clock**: Simple centered clock with date and day of week
 - **Large Clock**: Extra-large time display with date
 - **Logo**: Static branding screen that shows a centered logo bitmap. Swap in your own artwork by editing the bitmap in `src/clocks/clock_logo.cpp` (instructions are in the file header).
@@ -487,7 +431,7 @@ The companion app lets you select any sensor available on your system:
 
 **How to Select Sensors:**
 1. Make sure **LibreHardwareMonitor is running** (Windows) for temps/fans/GPU/power. The app falls back to its REST API on 0.9.5+.
-2. Open the companion app - double-click `pc_stats_monitor_v4.exe`, or right-click the tray icon and choose open. (Legacy: `python pc_stats_monitor_v2.py --edit`.)
+2. Open the companion app - double-click `pc_stats_monitor_v4.exe`, or right-click the tray icon and choose open
 3. Go to the **Sensors** page and browse the categories
 4. **Live current values** are shown next to each sensor to help you identify them
 5. Tick the sensors you want to monitor (up to 20)
@@ -501,7 +445,136 @@ The companion app lets you select any sensor available on your system:
 - Use the search box to quickly find specific sensors
 - Network metrics automatically distinguish between upload and download
 - You can select up to 20 different metrics
-- Labels set in Python GUI will override default names on ESP32
+- Labels set in the companion app override the default names on the ESP32
+
+## Audio Visualizer
+
+The display can show what your PC is playing: 32 spectrum bars or an
+oscilloscope trace, updated about 25 times a second.
+
+| | | |
+|:---:|:---:|:---:|
+| ![Classic EQ](img/screens/viz-eq.gif)<br>**Classic EQ** | ![Mirror EQ](img/screens/viz-mirror.gif)<br>**Mirror EQ** | ![Oscilloscope](img/screens/viz-scope.gif)<br>**Oscilloscope** |
+
+This is a **forced mode**, not a clock style. It needs a live audio stream, so
+it is switched on deliberately rather than sitting in the clock rotation, and it
+drops back to your normal screen about 10 seconds after the audio stops.
+
+### Turning it on
+
+1. **In the companion app** (Connection page), tick **Audio visualizer stream**.
+   The companion captures whatever your PC is playing (WASAPI loopback on
+   Windows, PulseAudio monitor on Linux) and sends it to the same UDP port the
+   stats already use.
+   - Windows: no extra setup.
+   - Linux / running from source: needs `soundcard` and `numpy`
+     (`pip install soundcard numpy`). The app tells you if they are missing.
+2. **Show it on the device**, in any of three ways:
+   - Tick **Start the visualizer when music plays** in the companion, and it
+     switches the display for you once sound has been playing for the start
+     delay, then hands the display back after the quiet period.
+   - Press **Show visualizer** on the device's *Audio visualizer* page.
+   - Tap the touch button while audio is playing. Tap again to leave.
+
+If the panel says *"No audio data..."*, the device is in visualizer mode but no
+stream is arriving - check the companion is running with the stream enabled.
+
+### Settings (device web portal, *Audio visualizer* page)
+
+| Setting | What it does |
+|---|---|
+| **Visualizer** | Classic EQ (bars from the bottom), Oscilloscope, or Mirror EQ (bars split around a centre line) |
+| **Bar texture** | Solid, Segmented (a dark row every third row - reads as an LED ladder), or Outline |
+| **Frame rate** | 15-60. See the note below |
+| **Peak hold** | A marker that hangs at each band's last peak and falls back under gravity |
+| **Corner clock** | Small HH:MM in the top right; costs the top 12 rows |
+| **Vertical gain** | Oscilloscope trace height, 50-200% |
+| **Ghost trace** | Dotted echo of the previous waveform |
+| **Graticule** | Oscilloscope grid. Off by default - it is the same white as the trace, so it competes with it |
+| **Fill to centre** | Fills between trace and centre line; goes solid when loud |
+
+**About the frame rate.** These OLED controllers have no double buffering: the
+firmware writes straight into the panel's memory while the panel is scanning it
+out. Drawing faster than the panel can show it does not look smoother, it looks
+torn. The whole 1024-byte framebuffer also has to cross the I2C bus every frame,
+which on the stock 400 kHz bus measures **37 fps on a 0.96" SSD1306** and
+**33 fps on a 1.3" SH1106** - so those are the real ceilings, whatever the
+setting says. The 30 fps default sits comfortably below both. Raise it if you
+want; if the picture tears, come back down.
+
+Advanced users can raise the bus itself with `DISPLAY_I2C_CLOCK` in
+`src/config/user_config.h` (default `400000`). 800 kHz roughly halves the
+transfer time, but it is above what these controllers are specified for and
+some panels or longer wiring will corrupt the image rather than fail cleanly.
+Change it only if you can watch the panel while you test.
+
+### Oscilloscope needs a recent companion
+
+The waveform is an extra 128 bytes appended to each packet. An older companion
+sends only the spectrum, and the oscilloscope will say *"Update PC companion
+for the waveform"*. The bar styles work with either.
+
+## Game Mode
+
+Pair a controller and play on the OLED. Like the visualizer, this is a
+**forced mode**: it takes over the display until you leave it, then the device
+goes back to its normal screen.
+
+| Game | Controls |
+|---|---|
+| **Falling Blocks** | Left/right move, up hard-drops, down soft-drops, A rotates one way, B or X the other, LB/RB hold |
+| **Snake** | D-pad or stick steers; every bite grows the snake and speeds it up |
+| **Bricks** | Stick or d-pad moves the paddle, A launches the ball |
+| **Space Rocks** | Left/right turn, up or RT thrusts, A or RB fires |
+| **Runner** | A or up jumps (hold for a higher jump), down ducks |
+| **Defenders** | Stick or d-pad moves, A, RB or RT fires; one shot in the air at a time |
+
+Every game shows its controls on the start screen. The Menu button pauses,
+View in the pause screen goes back to the game list, View in the list leaves
+game mode. Best scores are kept per game.
+
+### What you need
+
+- An **Xbox Wireless Controller** with Bluetooth LE: model 1708 (Xbox One S) or
+  the current Series X|S pad (1914), on **controller firmware 5.x or newer**.
+- The ESP32-C3 only speaks Bluetooth LE. Older pad firmware is Bluetooth Classic
+  only and the device will never see the pad. Update it once with the
+  **Xbox Accessories** app (Windows or Xbox console).
+
+### Playing
+
+1. Start game mode from the device web page (**Game mode** -> **Start game
+   mode**), with a **triple tap** on the touch button, or with
+   `/api/game/start`.
+2. The first time, hold the pad's **pair button** for 3 seconds. A paired pad
+   reconnects later with the Xbox button.
+3. Pick a game with the d-pad and press A.
+
+Game mode ends on its own if no pad connects within 2 minutes, if the pad is
+lost for 1 minute, or after a set time without input (5 minutes by default,
+configurable, or never). A quick tap on the touch button, `/api/game/stop` or
+any `/api/mode/*` call also ends it. The display stays at normal brightness
+while you play, even inside the night dimming window.
+
+### Settings (device web portal, *Game mode* page)
+
+| Setting | What it does |
+|---|---|
+| **Falling Blocks starting level** | 1-10 |
+| **Rumble** | Pad vibrates on hits, drops, cleared lines and game over |
+| **Falling Blocks: stick up hard-drops** | Off: only d-pad up drops, so a nudge on the stick never slams a piece down |
+| **Falling Blocks: landing preview** | Dots mark where the falling piece will land. Off by default |
+| **Auto exit** | Minutes without input before game mode ends (0 = never) |
+
+The same page shows the pad status and battery, lists the best scores with a
+reset button for each, and has **Forget paired pad**. Best scores are part of
+the configuration export, so a backup restores them.
+
+### Building without it
+
+Game mode pulls in the NimBLE Bluetooth stack (about 240 KB of flash). To leave
+it out, set `GAMEPAD_ENABLED` to `0` in `src/config/user_config.h`; the
+*Game mode* page then disappears from the web portal as well.
 
 ## HTTP Control API
 
@@ -523,10 +596,25 @@ Replace `smalloled.local` in the examples with your device's mDNS name (configur
 | GET | `/api/display/brightness?value=0-100` | Set display brightness (percent) |
 | GET | `/api/mode/clock` | Force the animated clock, even when the PC is online |
 | GET | `/api/mode/auto` | Resume automatic mode (PC stats when online, clock when offline) |
-| GET | `/api/clock/style?id=0-11` | Switch the clock animation |
+| GET | `/api/clock/style?id=<id>` | Switch the clock animation |
+| GET | `/api/mode/viz` | Show the audio visualizer (needs the companion's audio stream) |
+| GET | `/api/viz/style?id=0-2` | Switch the visualizer style |
+| GET | `/api/game/start` | Start game mode (waits for a pad) |
+| GET | `/api/game/stop` | Leave game mode |
+| GET | `/api/game/status` | Pad link, battery, paired state and each game's best score |
+| GET | `/api/game/forget` | Forget the paired pad |
+| GET | `/api/game/hiscore/reset[?id=N]` | Clear one game's best score (index from `games[]` in the status), or all of them |
 | GET | `/api/reboot` | Soft-restart the device (does **not** erase settings) |
 
-**Clock style IDs:** `0` = Mario, `1` = Standard, `2` = Large, `3` = Space Invaders, `5` = Arkanoid/Pong, `6` = Pac-Man, `7` = Snake, `8` = Tetris, `9` = Cycle All Styles, `10` = Asteroids, `11` = Dino Runner.
+**Clock style IDs:** `0` = Mario, `1` = Standard, `2` = Large, `3` = Space Invaders, `5` = Arkanoid/Pong, `6` = Pac-Man, `7` = Snake, `8` = Tetris, `9` = Cycle All Styles, `10` = Asteroids, `11` = Dino Runner, `14` = Weather, `16` = TRON, `18` = Game of Life, `19` = Dragon Ball. (The ids are a fixed set, not a range - the gaps are reserved so style numbers stay aligned with the sister project.)
+
+**Visualizer style IDs:** `0` = Classic EQ, `1` = Oscilloscope, `2` = Mirror EQ.
+
+**Write endpoints used by the web page** (`/save`, `/reset`, `/update`, `/api/import`) only accept POST requests that carry the header `X-SmallOLED: 1` (`/api/import` also accepts any request sent as `Content-Type: application/json`). This stops other websites open in your browser from changing settings or flashing firmware behind your back. Scripts just add the header, for example:
+
+```bash
+curl -H "X-SmallOLED: 1" -F "firmware=@firmware.bin" http://smalloled.local/update
+```
 
 ### Examples
 
@@ -545,6 +633,10 @@ curl http://smalloled.local/api/mode/auto
 # Switch to the Pac-Man clock
 curl "http://smalloled.local/api/clock/style?id=6"
 
+# Show the audio visualizer, then pick the oscilloscope
+curl http://smalloled.local/api/mode/viz
+curl "http://smalloled.local/api/viz/style?id=1"
+
 # Check current state
 curl http://smalloled.local/api/status
 ```
@@ -559,7 +651,9 @@ A `/api/status` response looks like:
   "forcedClock": true,
   "brightness": 100,
   "clockStyle": 0,
-  "pcOnline": false
+  "pcOnline": false,
+  "weatherValid": true,
+  "weatherAgeSeconds": 212
 }
 ```
 
@@ -572,6 +666,8 @@ A `/api/status` response looks like:
 | `brightness` | Current brightness, 0-100% |
 | `clockStyle` | Active clock style ID (see list above) |
 | `pcOnline` | `true` if the PC sender is currently sending stats |
+| `weatherValid` | `true` once the Weather clock has fetched data for the saved location |
+| `weatherAgeSeconds` | Seconds since that fetch (only present when `weatherValid` is `true`) |
 
 ### Home Assistant example
 
@@ -607,40 +703,34 @@ You can then call `rest_command.oled_display_off` / `oled_display_on` from an au
 - Check power supply (use quality USB cable)
 - Monitor serial output at 115200 baud for error messages
 
-### Python Script Issues (v2.0)
+### Companion App Issues
 
-**"No configuration found" - GUI won't open**
-- Make sure you have Tkinter installed (comes with Python on Windows)
-- Linux: Install with `sudo apt-get install python3-tk`
-- Check that you're running Python 3.7 or newer
+**The config window doesn't open**
+- Windows: the exe is unsigned, so SmartScreen may hold it on the first run - **More info → Run anyway**. Once it is running, right-click the tray icon to reopen the window.
+- Linux: a native window needs the system GTK/WebKit libraries (`sudo apt install gir1.2-webkit2-4.1 python3-gi`). Without them the app still runs and serves the same UI in your browser at `http://127.0.0.1:8737`.
 
-**"WMI not found" or hardware sensor errors (Windows)**
-- Make sure **LibreHardwareMonitor is running as Administrator**
-- Install dependencies: `pip install pywin32 wmi`
-- Check that WMI service is running: `services.msc` → Windows Management Instrumentation
+**Hardware sensor errors (Windows)**
+- Make sure **LibreHardwareMonitor is running as Administrator** - without admin it reports no temps, fans or power
+- Check that the WMI service is running: `services.msc` → Windows Management Instrumentation
 
-**No sensors showing in GUI (Windows)**
-- Run LibreHardwareMonitor **before** starting the Python script
-- If using LibreHardwareMonitor 0.9.5+, enable: Options → Remote Web Server → Run
-- The script will auto-detect and use the REST API when WMI is unavailable
-- Wait a few seconds after launching LibreHardwareMonitor before running Python script
+**No sensors showing (Windows)**
+- Start LibreHardwareMonitor **before** the companion app, and give it a few seconds
+- On LibreHardwareMonitor 0.9.5+, enable Options → Remote Web Server → Run. Its WMI backend is broken; the app falls back to the REST API, which that option serves
+- Leave **Sensor source** on **Auto** unless you have a reason to force a mode, then hit **Rescan sensors**
 
 **No data on ESP32 display**
-- Verify ESP32 IP address in Python GUI matches actual IP (shown on OLED)
+- Verify the ESP32 IP address on the **Connection** page matches the one shown on the OLED, and use **Test connection**
 - Check Windows Firewall isn't blocking UDP port 4210
 - Ensure both PC and ESP32 are on the same network
-- Open ESP32 web interface and check the **Visible metrics** page
-- Try running: `python pc_stats_monitor_v2.py` (not minimized) to see console output
+- Open the ESP32 web interface and check the **Visible metrics** page - metrics arrive unplaced until you position them
 
 **Autostart not working (Windows)**
-- Make sure `pywin32` is installed: `pip install pywin32`
-- Check Windows Startup folder: Press `Win + R`, type `shell:startup`
-- Look for "PC Monitor.lnk" shortcut
-- For system tray mode, install: `pip install pystray pillow`
+- The **Start with Windows** tick box writes an HKCU Run entry; check Task Manager → Startup
+- It launches minimized to the tray, so look for the tray icon rather than a window
 
 **Autostart not working (Linux)**
-- Check service status: `systemctl --user status pc-monitor`
-- View logs: `journalctl --user -u pc-monitor -f`
+- Check service status: `systemctl --user status smalloled-companion`
+- View logs: `journalctl --user -u smalloled-companion -f`
 - Make sure systemd is available on your system
 - Enable lingering (optional): `loginctl enable-linger $USER`
 
@@ -649,11 +739,13 @@ You can then call `rest_command.oled_display_off` / `oled_display_on` from an au
 - Upload/download speeds are calculated from byte deltas
 - First reading will always be 0, wait for next update cycle
 
+**Audio visualizer says "No audio data..."**
+- The device is in visualizer mode but nothing is arriving - tick **Audio visualizer stream** on the companion's Connection page
+- Linux / running from source also needs `soundcard` and `numpy`, and a PulseAudio/PipeWire monitor source for the default output
+
 **Custom labels not appearing on ESP32**
-- Labels are set in Python GUI, not ESP32 web interface
-- Run `python pc_stats_monitor_v2.py --edit` to modify labels
-- ESP32 receives the label name from Python script
-- Check that Python script successfully connects (see console output)
+- Set them on the companion's **Sensors** page (max 10 characters), then **Save & push to device**
+- They can also be set per metric in the device's own **Visible metrics** page
 
 ## Technical Details
 
@@ -661,15 +753,15 @@ You can then call `rest_command.oled_display_off` / `oled_display_on` from an au
 - **Protocol**: UDP
 - **Port**: 4210 (configurable)
 - **Format**: JSON
-- **Update Rate**: 3 seconds (configurable via GUI)
-- **Max Metrics**: 20 (increased from 12 in v1.x)
+- **Update Rate**: 3 seconds (configurable in the app)
+- **Max Metrics**: 20
+- **Audio stream**: same UDP port, ~25 packets/s, spectrum plus an optional 128-byte waveform
 
-### v2.0 Improvements
-- **JSON-based configuration** stored in `monitor_config.json` (Windows) or `monitor_config_linux.json` (Linux)
-- **Dynamic sensor discovery** - automatically detects all available sensors
+### Companion App Internals
+- **JSON configuration** in `%APPDATA%\SmallOLED-Companion\monitor_config.json` (Windows) or `~/.config/smalloled-companion/monitor_config.json` (Linux)
+- **Dynamic sensor discovery** - detects every sensor the system exposes
 - **REST API fallback** - automatic support for LibreHardwareMonitor 0.9.5+ (broken WMI)
 - **Network metrics** calculated in real-time (upload/download speeds)
-- **5-row/6-row display modes** with optimized spacing (13px vs 10px)
 - **Export/Import** configuration for easy backup and sharing
 - **Systemd integration** (Linux) for proper service management
 
@@ -680,25 +772,26 @@ You can then call `rest_command.oled_display_off` / `oled_display_on` from an au
 - Adafruit SSD1306 / Adafruit SH110X
 - Adafruit GFX
 - ArduinoJson
+- NimBLE-Arduino (game mode controller link)
 
-**Python (Windows):**
+**Companion app (Windows):**
 - psutil (system stats & network)
 - pywin32/wmi (LibreHardwareMonitor integration)
-- tkinter (GUI - included with Python)
-- pystray/pillow (system tray - optional)
+- pywebview (native window hosting the local web UI)
+- pystray/pillow (system tray)
 
-**Python (Linux):**
+**Companion app (Linux):**
 - psutil (system stats, temps, fans, network)
-- tkinter (GUI)
+- pywebview (native window, falls back to the browser)
+- soundcard/numpy (audio visualizer - optional)
 
 ### File Structure
 ```
-pc_stats_monitor_v2.py          # Windows version with GUI
-pc_stats_monitor_v2_linux.py    # Linux version with GUI
-monitor_config.json              # Windows config (auto-generated)
-monitor_config_linux.json        # Linux config (auto-generated)
-pc_stats_monitor.py              # Legacy Windows script (v1.x)
-pc_stats_monitor_linux.py        # Legacy Linux script (v1.x)
+PC-Companion-App-v4/
+  companion-common/     # shared UI, server and protocol code
+  win-companion/        # Windows app, source of pc_stats_monitor_v4.exe
+  linux-companion/      # Linux app, run from source
+monitor_config.json     # per-user config (auto-generated, see path above)
 ```
 
 ## Advanced / Optional Features
@@ -782,7 +875,7 @@ Automatically dim the display during nighttime hours. Configured via the web int
 
 ### OTA Firmware Updates
 
-Upload new firmware wirelessly through the web interface at `http://<device-ip>/update`. No need to physically connect USB after the initial flash.
+Upload new firmware wirelessly through the web interface at `http://<device-ip>/update`. No need to physically connect USB after the initial flash. When a newer release is out, the web page shows a badge in the top bar and names the matching `OTA_ONLY` file on the Maintenance page (your browser checks GitHub, the device does not).
 
 ## License
 
@@ -791,3 +884,7 @@ This project is open source. Feel free to modify and share!
 ## Credits
 
 Created for monitoring PC stats on a small OLED display. Mario animation inspired by classic pixel art.
+
+## Trademarks
+
+SmallOLED is an independent open-source project. It is not affiliated with, endorsed by or sponsored by Nintendo, Bandai Namco, Taito, The Tetris Company, Microsoft or any other company. Game and character names are used only to describe the style of an animation; all trademarks belong to their respective owners. Every sprite and animation is original low-resolution pixel art drawn by the code in this repository; no artwork, sprite sheets, ROM data, fonts, sounds or music from any commercial game are copied or distributed here, and the firmware does not emulate any of those games.

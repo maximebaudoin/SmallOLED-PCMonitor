@@ -12,7 +12,7 @@ Run from source (no build step):
     python3 pc_stats_monitor_v4_linux.py
 A native window needs the GTK/WebKit libs (Debian/Ubuntu:
     sudo apt install gir1.2-webkit2-4.1 python3-gi); without them the UI opens
-in the default browser at http://127.0.0.1:8736 .
+in the default browser at http://127.0.0.1:8737 .
 """
 
 import argparse
@@ -53,9 +53,20 @@ SUPPORTS_SOURCE_SELECT = False
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
+# Was "PCStatsMonitor", which every fork of this companion also claimed.
+DATA_DIR_NAME = "smalloled-companion"
+DATA_DIR_ENV = "SMALLOLED_CONFIG_DIR"
+
+
 def get_data_dir():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    d = os.path.join(base, "PCStatsMonitor")
+    """Path resolution only; the copy out of the old shared folder runs from
+    main() once the lock is held."""
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        d = os.path.abspath(override)
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        d = os.path.join(base, DATA_DIR_NAME)
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
@@ -71,6 +82,11 @@ DEFAULT_CONFIG = {
     "esp32_ip": "192.168.0.163",
     "udp_port": 4210,
     "update_interval": 3,
+    "audio_viz": False,
+    "audio_viz_auto": False,
+    "audio_viz_threshold": -45.0,
+    "audio_viz_start_delay": 3.0,
+    "audio_viz_stop_delay": 20.0,
     "metrics": [],
 }
 
@@ -89,15 +105,30 @@ def load_config():
     if not os.path.exists(CONFIG_FILE):
         return None
     try:
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+        # utf-8-sig: a BOM is otherwise a parse error on a good config.
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            raise ValueError("top level is %s, not an object" % type(config).__name__)
+        return config
     except Exception as e:
-        print("Error loading config: %s" % e)
+        # Keep a copy before defaults take over: the next save would otherwise
+        # overwrite the damaged file and the whole setup would be unrecoverable.
+        try:
+            import app_paths
+            app_paths.quarantine_unreadable_config(CONFIG_FILE, e)
+        except Exception:
+            print("Error loading config: %s" % e)
         return None
 
 
 def save_config(config):
     try:
+        try:
+            import app_paths
+            config["app"] = app_paths.APP_TAG
+        except Exception:
+            pass
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=2)
         return True
@@ -202,11 +233,70 @@ def collect_metrics(config, snapshot, last_good_values=None, status_code=STATUS_
 # ---------------------------------------------------------------------------
 # Autostart (systemd --user unit)
 # ---------------------------------------------------------------------------
-_SERVICE_NAME = "pcstatsmonitor.service"
+_SERVICE_NAME = "smalloled-companion.service"
+# Removed only when its ExecStart points at this script.
+_LEGACY_SERVICE_NAME = "pcstatsmonitor.service"
 
 
-def _service_path():
-    return os.path.expanduser("~/.config/systemd/user/" + _SERVICE_NAME)
+def _service_path(name=None):
+    return os.path.expanduser("~/.config/systemd/user/" + (name or _SERVICE_NAME))
+
+
+def migrate_legacy_autostart():
+    """Take over the old shared systemd unit, but only if it is ours."""
+    import subprocess
+    old = _service_path(_LEGACY_SERVICE_NAME)
+    if not os.path.exists(old):
+        return ""
+    try:
+        with open(old, "r") as f:
+            unit = f.read()
+    except Exception as e:
+        return "Autostart: could not read %s (%s)." % (old, e)
+
+    ours = os.path.normpath(os.path.abspath(__file__))
+    exec_line = ""
+    for line in unit.splitlines():
+        if line.startswith("ExecStart="):
+            exec_line = line
+            break
+    if ours not in exec_line:
+        return ("Autostart: left %s alone - its ExecStart does not reference "
+                "this script." % old)
+
+    new = _service_path()
+    if os.path.exists(new):
+        return ""
+    try:
+        unit = unit.replace("Description=PC Stats Monitor",
+                            "Description=SmallOLED PC Companion")
+        with open(new, "w") as f:
+            f.write(unit)
+        for cmd in (["disable", _LEGACY_SERVICE_NAME], ["stop", _LEGACY_SERVICE_NAME]):
+            subprocess.run(["systemctl", "--user"] + cmd, check=False)
+        os.remove(old)
+        for cmd in (["daemon-reload"], ["enable", _SERVICE_NAME]):
+            subprocess.run(["systemctl", "--user"] + cmd, check=False)
+    except Exception as e:
+        return "Autostart: could not rename %s (%s)." % (_LEGACY_SERVICE_NAME, e)
+    return "Autostart: renamed %s to %s." % (_LEGACY_SERVICE_NAME, _SERVICE_NAME)
+
+
+def _run_first_launch_migration():
+    """No-op once done, so it is safe to call on every launch."""
+    try:
+        import app_paths
+        note = app_paths.migrate_legacy_config(DATA_DIR)
+        if note:
+            print(note)
+    except Exception as e:
+        print("Config migration skipped: %s" % e)
+    try:
+        note = migrate_legacy_autostart()
+        if note:
+            print(note)
+    except Exception as e:
+        print("Autostart migration skipped: %s" % e)
 
 
 def is_autostart_enabled():
@@ -253,11 +343,18 @@ def setup_autostart(enable=True):
 # Tray icon (shared app_window uses it when TRAY_AVAILABLE)
 # ---------------------------------------------------------------------------
 def create_tray_icon():
+    """The device portal's brand mark, so tray and web UI match."""
     if not TRAY_AVAILABLE:
         return None
-    image = Image.new("RGB", (64, 64), color="black")
-    dc = ImageDraw.Draw(image)
-    dc.rectangle([16, 16, 48, 48], fill="cyan")
+    try:
+        import brand_icon
+        image = brand_icon.render(64)
+        if image is not None:
+            return image
+    except Exception:
+        pass
+    image = Image.new("RGB", (64, 64), color=(31, 138, 91))
+    ImageDraw.Draw(image).rectangle([16, 16, 48, 48], fill="white")
     return image
 
 
@@ -265,8 +362,9 @@ def create_tray_icon():
 # Single-instance coordination (socket lock + IPC) - same as the Windows core
 # ---------------------------------------------------------------------------
 SINGLE_INSTANCE_HOST = "127.0.0.1"
-SINGLE_INSTANCE_PORT = 42100
-_SINGLE_INSTANCE_MAGIC = b"PCMON1"
+# 42100/PCMON1 was every fork's shared identity; see the Windows core.
+SINGLE_INSTANCE_PORT = int(os.environ.get("SMALLOLED_IPC_PORT") or 42101)
+_SINGLE_INSTANCE_MAGIC = b"SMOLED1"
 _single_instance_sock = None
 _reload_event = threading.Event()
 _show_event = threading.Event()
@@ -373,6 +471,13 @@ def main():
         return
     if role == "primary":
         start_single_instance_listener()
+    else:
+        print("WARNING: port %d is held by another program, so duplicate-launch "
+              "protection is off for this session. Set SMALLOLED_IPC_PORT to a "
+              "free port to restore it." % SINGLE_INSTANCE_PORT)
+
+    # Lock holder only: racing first launches would otherwise both migrate.
+    _run_first_launch_migration()
 
     import app_window
     start_hidden = args.minimized and not (args.configure or args.edit)
